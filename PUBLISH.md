@@ -6,44 +6,71 @@
 > 前置：已安装 Git（`winget install --id Git.Git -e --source winget`），
 > 装完要**重开一个终端**，PATH 才会刷新。
 
+> **当前状态**：仓库已初始化、首次提交已完成（`feat: initial release of dsh-balance-hud`）。
+> 还差：注册 GitHub → 换成匿名邮箱 → 建空仓库 → 推送。见下面第 0 / 1 / 3 / 4 节。
+
+---
+
+## 0. 注册 GitHub（如果还没有账号）
+
+打开 https://github.com/signup
+
+1. 填**邮箱**（之后可以隐藏，不会公开）、**密码**、**用户名**。
+   - 用户名会成为仓库地址的一部分：`github.com/<用户名>/dsh-balance-hud`，也用于生成匿名邮箱。
+   - 用户名一旦定了改名比较麻烦，建议选正式的。
+2. 完成邮箱验证码验证，通过人机验证。
+3. 登录后立刻做**隐藏邮箱**这一步（见第 1 节）。
+
+GitHub 免费账号即可，开源公开仓库不需要付费。
+
 ---
 
 ## 1. 设置 Git 身份（只需一次）
 
-提交记录会**永久**带上这个信息，用你愿意公开的名字和邮箱：
+### 1a. 先拿到 GitHub 的匿名邮箱
 
-```powershell
-git config --global user.name  "你的名字"
-git config --global user.email "你的邮箱"
-```
+> 路径：右上角头像 → **Settings** → 左侧 **Emails**
+> → 勾选 **Keep my email addresses private**
+> → 同页会显示 `12345678+你的用户名@users.noreply.github.com`
 
-不想暴露真实邮箱的话，用 GitHub 提供的匿名地址：
-`GitHub → Settings → Emails → Keep my email addresses private`，
-页面会给出形如 `12345678+你的用户名@users.noreply.github.com` 的地址。
+那串**完整的地址**（含前面的数字）才是能正确归属到你账号的匿名邮箱。
 
-验证：
-
-```powershell
-git config --global --list
-```
-
----
-
-## 2. 首次提交
-
-仓库已经初始化好了（`git init -b main` 已执行、文件已暂存）。
-只剩身份设置好之后执行：
+### 1b. 写进本仓库的配置
 
 ```powershell
 cd <本仓库所在目录>          # 例如 ...\_plugin_build\dsh-balance-hud
-git status            # 确认 17 个文件，且没有 node_modules / .env
-git commit -m "feat: initial release of dsh-balance-hud"
+git config user.name  "LHY"
+git config user.email "12345678+你的用户名@users.noreply.github.com"
+```
+
+> 这里用 `--local`（不加 `--global`）：身份只作用于本仓库，不影响你机器上别的项目。
+
+### 1c. 修正已完成的首次提交
+
+首次提交目前用的是占位邮箱 `LHY@users.noreply.github.com`。
+换成正式匿名地址（**不需要重建仓库**）：
+
+```powershell
+git commit --amend --reset-author --no-edit
+git log --format='%an <%ae>' -1        # 确认已变成新地址
 ```
 
 想反悔这次提交（还没推送时随时可以）：
 
 ```powershell
 git reset --soft HEAD~1
+```
+
+---
+
+## 2. 首次提交（已完成）
+
+如果哪天需要在一个新克隆上重做，等价命令是：
+
+```powershell
+git add .
+git status            # 确认 17 个文件，且没有 node_modules / .env
+git commit -m "feat: initial release of dsh-balance-hud"
 ```
 
 ---
