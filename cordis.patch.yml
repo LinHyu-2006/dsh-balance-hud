@@ -1,0 +1,5 @@
+# dsh bundle patch：把本插件挂进 profile 的层叠顺序。
+# host 半边只做能力自检（余额 Remote / 会话用量投影是否在位），UI 全部在 client 半边。
+- insert:
+    - id: balance-hud
+      name: 'dsh-balance-hud'

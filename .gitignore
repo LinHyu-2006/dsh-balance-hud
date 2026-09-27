@@ -1,0 +1,17 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 本地环境（不要提交）
+.env
+.env.*
+*.local
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 冒烟测试的临时文件
+*.ck.cjs
