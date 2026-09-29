@@ -345,7 +345,7 @@ node tools/install.mjs --profile <dir>     # 指定别的 profile
 > 并保留一份 `package.json.bak-balance-hud` 备份。
 
 改**客户端**半边（`lib/client.js`）只需刷新页面。改 **Host** 半边（`lib/index.js`，
-例如那条赠金路由）需要**重启 DSH**，因为 profile bundles 不热加载。
+例如赠金路由或价格抓取）需要**重启 DSH**，因为 profile bundles 不热加载。
 
 ## 开发
 
@@ -362,14 +362,18 @@ node tools/verify-install.mjs             # 校验真实安装
 持久化与迁移链，以及可见性驱动的补读。A1–A3 三个新功能各有守卫：**两个**槽位注册
 （浮层 **和** 设置行）、设置默认值、脏配置的逐字段收敛、配置落盘往返、容器广播 + 部分合并 +
 取消订阅、配置损坏回落、四档预算与剩余夹 0、两条预算取最严重、每日台账（累加 / 忽略 0 与负数 /
-跨天归零 / 损坏回落），以及峰谷倒计时在峰时、闲时、跨午休与跨周末的正确性。
+跨天归零 / 损坏回落），以及峰谷倒计时在峰时、闲时、跨午休与跨周末的正确性。价格同步也各有一条
+守卫：解析器对真实页面的固定用例、以及对「UTF-8 被误按 Latin-1 解码」的乱码副本给出同一张表；
+页面结构损坏或档位反常时**整条放弃**；`resolvePrices` 的来源可分辨；缓存落盘往返保留条件请求头；
+以及默认零外联 —— 非法间隔收敛为关闭、`24 小时` 是默认档。
 
 CI（`.github/workflows/ci.yml`）在 **ubuntu / windows / macos** 上用 Node 20 跑这两个离线脚本 ——
 `node tools/smoke.mjs` 与 `node tools/verify-install.mjs --package`。两个脚本都**完全离线**：
 不依赖 DSH 安装、不联网、不需要构建，所以能在干净容器里跑，也顺带证明行尾
 （`.gitattributes` 锁 LF）、路径派生与 `import.meta` 用法都不依赖 Windows。
 
-它**不覆盖** Host 半边（`lib/index.js` 从未被加载）、真实浏览器、真实 Cordis 注入和真实平台。
+它**不覆盖** Host 半边（`lib/index.js` 从未被加载，因此回环过滤、对外价格抓取、
+`If-None-Match`/304 路径与模型列表路由都没有离线测试）、真实浏览器、真实 Cordis 注入和真实平台。
 `lib/client.js` 是手写的 CJS 风格 bundle，格式就是官方的
 `window.__ModuleLoader__.load({ id, factory })`，所以**没有构建步骤**。
 

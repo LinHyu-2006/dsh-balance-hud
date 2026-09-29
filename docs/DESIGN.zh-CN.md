@@ -34,7 +34,8 @@
 ```text
 浏览器 ──fetch──► GET /api/balance-hud/balance    （只读、仅回环）
                   GET /api/balance-hud/bonuses    （只读、仅回环、不回执）
-                  GET /api/balance-hud/…          （价格同步：需主动开启；模型列表：仅回环）
+                  GET /api/balance-hud/pricing    （价格同步：需主动开启）
+                  GET /api/balance-hud/models     （模型列表：仅回环）
                   │
                   └─► ctx.deepseekAccount.getBalance()
                       ctx.deepseekAccount.getUnnotifiedBonuses()
@@ -556,6 +557,9 @@ node tools/verify-install.mjs             # 校验真实安装
 充值**与过期**两类外部变动判据、持久化与 v1→v4 迁移链、可见性补读，以及设置（默认值 /
 脏配置收敛 / 落盘往返 / 容器广播与部分合并 / 损坏回落）、预算四档与剩余夹 0、两条预算取最严重、
 每日台账（累加 / 忽略 0 与负数 / 跨天归零 / 损坏回落）、峰谷倒计时（峰时 / 闲时 / 午休 / 跨周末）。
+价格部分同样有守卫：真实页面的固定用例、乱码（UTF-8 被按 Latin-1 解码）副本给出同一张表、
+结构损坏或档位反常时整体放弃、`resolvePrices` 来源可分辨、缓存落盘往返保留条件请求头，
+以及默认零外联（非法间隔收敛为关闭、`24 小时` 是默认档）。
 
 **它不覆盖**：Host 半边（`lib/index.js` 从不加载，因此可选的价格同步抓取、
 `If-None-Match`/304 路径与模型列表路由都没有离线测试）、真实浏览器、真实 Cordis 注入、

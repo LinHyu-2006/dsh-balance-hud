@@ -416,8 +416,8 @@ profile's `node_modules` (a junction on Windows, a symlink elsewhere), and resta
 > BOM and keeps a `package.json.bak-balance-hud` backup.
 
 Changing the **client** half (`lib/client.js`) needs only a page refresh. Changing the **Host**
-half (`lib/index.js`, e.g. the bonuses route) needs a **DSH restart**, because profile bundles are
-not hot-loaded.
+half (`lib/index.js`, e.g. the bonuses route or the price-sync fetch) needs a **DSH restart**, because
+profile bundles are not hot-loaded.
 
 ## Development
 
@@ -438,9 +438,14 @@ visibility-driven refetch. The A1–A3 features have their own guards: the **two
 config, the persistence round trip, container broadcast with partial merge and unsubscribe, the
 corrupt-config fallback, the four budget levels with clamping, most-severe-of-two selection, the
 daily ledger (accumulate / ignore 0 and negatives / cross-day reset / corrupt fallback), and the peak
-countdown across peak, off-peak, lunch break and weekend. One persistence guard is the lossless round
-trip: switching sessions through `checkoutSession` must leave `baseline` / `lastRead` / `lastBalance` /
-`spent` untouched, and the persisted blob must contain no `undefined` field.
+countdown across peak, off-peak, lunch break and weekend. The price-sync guards are there too: the
+parser against a fixed copy of the real page and against a mojibake (UTF-8 read as Latin-1) copy, a
+wholesale rejection when the page is malformed or the tiers are inverted, `resolvePrices` provenance,
+the cache round trip preserving the conditional-request validators, and the opt-in default — an illegal
+interval sanitises to `off`, `24 h` is the default interval, and nothing runs until the user acts. One
+persistence guard is the lossless round trip: switching sessions through `checkoutSession` must leave
+`baseline` / `lastRead` / `lastBalance` / `spent` untouched, and the persisted blob must contain no
+`undefined` field.
 
 CI (`.github/workflows/ci.yml`) runs both offline scripts — `node tools/smoke.mjs` and
 `node tools/verify-install.mjs --package` — on **ubuntu, windows and macos** with Node 20. Neither
@@ -448,9 +453,11 @@ script needs a DSH install, network access or a build step, so the matrix runs i
 proves that line endings (`.gitattributes` pins LF), path derivation and `import.meta` usage do not
 depend on Windows.
 
-It does **not** cover the Host half (`lib/index.js` is never loaded), a real browser, real Cordis
-injection, or the real platform. `lib/client.js` is a hand-written CJS-style bundle in the official
-`window.__ModuleLoader__.load({ id, factory })` format, so there is **no build step**.
+It does **not** cover the Host half (`lib/index.js` is never loaded — so the loopback filter, the
+outbound price fetch, its `If-None-Match`/`304` path and the model-list route have no offline test), a
+real browser, real Cordis injection, or the real platform. `lib/client.js` is a hand-written CJS-style
+bundle in the official `window.__ModuleLoader__.load({ id, factory })` format, so there is **no build
+step**.
 
 | File | Role |
 | --- | --- |
