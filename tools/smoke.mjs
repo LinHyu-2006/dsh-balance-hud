@@ -315,7 +315,7 @@ function makeCtx({ usage }) {
           return () => {};
         },
         register: (options, Component) => {
-          registered.push({ options, Component });
+          registered.push({ slot: options.name, options, Component });
           return () => {};
         }
       },
@@ -348,8 +348,13 @@ async function mount({ usage, withSessionsShare = true, mode = 'ready', balance 
 
   const { ctx, registered } = makeCtx({ usage });
   plugin.apply(ctx);
-  if (registered.length !== 1) throw new Error(`期望 1 个槽位注册，实际 ${registered.length}`);
-  const { options, Component } = registered[0];
+  // 现在有两个注册点：浮层 + 设置里的偏好行
+  if (registered.length !== 2) throw new Error(`期望 2 个槽位注册，实际 ${registered.length}`);
+  const overlayEntry = registered.find((entry) => entry.slot === 'shell.overlay');
+  const settingsEntry = registered.find((entry) => entry.slot === 'settings.general.item');
+  if (overlayEntry === undefined) throw new Error('没有注册 shell.overlay');
+  if (settingsEntry === undefined) throw new Error('没有注册 settings.general.item');
+  const { options, Component } = overlayEntry;
   if (options.name !== 'shell.overlay') throw new Error(`槽位名不符：${options.name}`);
   if (options.id !== 'balance-hud') throw new Error(`槽位 id 不符：${options.id}`);
 
@@ -1068,6 +1073,147 @@ await settle();
 await settle();
 if (balanceReads <= before) throw new Error('回到前台后未立刻补读余额');
 console.log(`✓ 可见性联动：回前台立刻补读（${before} → ${balanceReads}）`);
+
+// 10) A1 设置：配置容器、收敛、持久化
+{
+  const {
+    defaultSettings, normalizeSettings, loadSettings, saveSettings,
+    createSettingsStore, settingsKey
+  } = normal.plugin.__test;
+  // 用"当前"的替身：前面每次 mount 都会重装一个，早先那个变量可能已被丢弃。
+  const settingsStorage = installStorageMock();
+
+  // 默认值
+  const base = defaultSettings();
+  if (base.model !== 'deepseek-flash' || base.pollSeconds !== 60) {
+    throw new Error(`默认配置不符：${JSON.stringify(base)}`);
+  }
+  console.log('✓ 设置：默认配置（flash / 60s / 未设预算）');
+
+  // 脏数据必须被收敛，而不是让 HUD 崩掉
+  const dirty = normalizeSettings({
+    model: 'gpt-5',                 // 非法模型 → 回落
+    pollSeconds: 999999,            // 非法间隔 → 回落
+    hiddenPollSeconds: -1,
+    showAccountTotal: 'yes',        // 非布尔 → 回落
+    sessionBudget: -5,              // 负数 → 回落
+    dailyBudget: 'abc',
+    peakWarnMinutes: 7,             // 不在选项里 → 回落
+    notifyPeak: true
+  });
+  if (dirty.model !== 'deepseek-flash') throw new Error(`非法模型未收敛：${dirty.model}`);
+  if (dirty.pollSeconds !== 60) throw new Error(`非法间隔未收敛：${dirty.pollSeconds}`);
+  if (dirty.showAccountTotal !== true) throw new Error('非布尔未收敛');
+  if (dirty.sessionBudget !== 0) throw new Error(`负预算未收敛：${dirty.sessionBudget}`);
+  if (dirty.peakWarnMinutes !== 10) throw new Error(`非法提前量未收敛：${dirty.peakWarnMinutes}`);
+  if (dirty.notifyPeak !== true) throw new Error('合法值被误改');
+  console.log('✓ 设置：脏数据逐字段收敛，合法值不动');
+
+  // 持久化 + 订阅
+  saveSettings({ model: 'deepseek-v4-pro', pollSeconds: 30 });
+  const reloaded = loadSettings();
+  if (reloaded.model !== 'deepseek-v4-pro' || reloaded.pollSeconds !== 30) {
+    throw new Error(`持久化失败：${JSON.stringify(reloaded)}`);
+  }
+  if (!settingsStorage.getItem(settingsKey)) throw new Error('配置未落盘');
+  console.log('✓ 设置：落盘并读回');
+
+  // 容器：set 会广播，且两处（设置行 / 浮层）看到同一份
+  const store2 = createSettingsStore();
+  let seen = 0;
+  const unsub = store2.subscribe(() => { seen += 1; });
+  store2.set({ sessionBudget: 12.5 });
+  if (seen !== 1) throw new Error(`订阅未触发：${seen}`);
+  if (store2.get().sessionBudget !== 12.5) throw new Error('容器未更新');
+  // 部分合并：只改一个字段，其它保留
+  if (store2.get().model !== 'deepseek-v4-pro') throw new Error('set 覆盖了无关字段');
+  unsub();
+  store2.set({ sessionBudget: 1 });
+  if (seen !== 1) throw new Error('取消订阅后仍触发');
+  console.log('✓ 设置：容器广播 + 部分合并 + 可取消订阅');
+
+  // 损坏的 JSON 不能让插件崩
+  settingsStorage.setItem(settingsKey, '{ not json');
+  if (loadSettings().pollSeconds !== 60) throw new Error('损坏配置未回落默认');
+  console.log('✓ 设置：配置损坏时回落默认（不抛错）');
+}
+
+// 11) A2 预算：分档与最严重级别
+{
+  const { evaluateBudget, worstBudgetLevel } = normal.plugin.__test;
+  if (evaluateBudget(1, 0).level !== 'none') throw new Error('未设预算应为 none');
+  if (evaluateBudget(1, 10).level !== 'none') throw new Error('10% 不该告警');
+  if (evaluateBudget(7.5, 10).level !== 'warn') throw new Error('75% 应为 warn');
+  if (evaluateBudget(9, 10).level !== 'critical') throw new Error('90% 应为 critical');
+  if (evaluateBudget(12, 10).level !== 'over') throw new Error('超限应为 over');
+  const over = evaluateBudget(12, 10);
+  if (over.remaining !== 0) throw new Error(`超限后剩余应夹到 0：${over.remaining}`);
+  if (Math.abs(evaluateBudget(3, 10).remaining - 7) > 1e-9) throw new Error('剩余额算错');
+  console.log('✓ 预算：75% warn / 90% critical / 超限 over，剩余夹到 0');
+
+  if (worstBudgetLevel(['none', 'warn', 'critical']) !== 'critical') throw new Error('未取最严重');
+  if (worstBudgetLevel(['over', 'none']) !== 'over') throw new Error('over 应最严重');
+  if (worstBudgetLevel(['none', 'none']) !== 'none') throw new Error('全 none 应 none');
+  console.log('✓ 预算：两条预算取最严重的一条');
+}
+
+// 12) A2 每日台账：跨天归零、只吃确认值
+{
+  const { addDailySpent, loadDaily, beijingDateKey, dailyKey } = normal.plugin.__test;
+  const dailyStorage = installStorageMock();
+  if (loadDaily().total !== 0) throw new Error('初始应为 0');
+  const t1 = addDailySpent(1.5);
+  const t2 = addDailySpent(0.5);
+  if (Math.abs(t1 - 1.5) > 1e-9 || Math.abs(t2 - 2) > 1e-9) throw new Error(`累计错：${t1} / ${t2}`);
+  // 0 或负数不累计
+  if (Math.abs(addDailySpent(0) - 2) > 1e-9) throw new Error('0 不该累计');
+  if (Math.abs(addDailySpent(-3) - 2) > 1e-9) throw new Error('负数不该累计');
+  console.log('✓ 每日台账：累加确认花费，0/负数忽略');
+
+  // 跨天：把手上的日期改成昨天，读的时候必须归零
+  const stale = JSON.parse(dailyStorage.getItem(dailyKey));
+  dailyStorage.setItem(dailyKey, JSON.stringify({ date: '2000-01-01', total: 99 }));
+  const after = loadDaily();
+  if (after.total !== 0) throw new Error(`跨天未归零：${after.total}`);
+  if (after.date !== beijingDateKey(new Date())) throw new Error('跨天后日期未更新');
+  void stale;
+  console.log('✓ 每日台账：跨天自动归零');
+
+  // 损坏内容不抛
+  dailyStorage.setItem(dailyKey, 'oops');
+  if (loadDaily().total !== 0) throw new Error('损坏台账未回落');
+  console.log('✓ 每日台账：内容损坏时回落 0');
+}
+
+// 13) A3 峰谷：切换倒计时与提醒窗口
+{
+  const { minutesUntilTierChange } = normal.plugin.__test;
+  // 北京时间 = UTC+8。用固定 UTC 时刻构造，避免依赖本机时区。
+  const bj = (y, m, d, hh, mm) => new Date(Date.UTC(y, m - 1, d, hh - 8, mm));
+  const checks = [
+    // 周一 08:50 北京时间 → 10 分钟后进入峰时
+    [bj(2026, 1, 5, 8, 50), 'peak', 10],
+    // 周一 09:30 → 峰时中，150 分钟后回闲时（到 12:00）
+    [bj(2026, 1, 5, 9, 30), 'off', 150],
+    // 周一 12:30 → 90 分钟后进入峰时（14:00）
+    [bj(2026, 1, 5, 12, 30), 'peak', 90],
+    // 周一 17:50 → 10 分钟后回闲时
+    [bj(2026, 1, 5, 17, 50), 'off', 10],
+    // 周五 18:30 → 下一个峰时是周一 09:00（14.5 小时 = 870 分钟）
+    [bj(2026, 1, 9, 18, 30), 'peak', 870],
+    // 周六 12:00 → 周一 09:00
+    [bj(2026, 1, 10, 12, 0), 'peak', 45 * 60]
+  ];
+  for (const [when, to, minutes] of checks) {
+    const got = minutesUntilTierChange(when);
+    if (got.to !== to || got.minutes !== minutes) {
+      throw new Error(
+        `峰谷倒计时不符：${when.toISOString()} 期望 ${to}/${minutes}，实际 ${got.to}/${got.minutes}`
+      );
+    }
+  }
+  console.log('✓ 峰谷：峰前/峰后/跨午休/跨周末的倒计时都对');
+}
 
 console.log('\n全部冒烟测试通过');
 // 组件里的轮询定时器会吊住事件循环，显式退出。

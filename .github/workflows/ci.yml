@@ -1,0 +1,33 @@
+name: CI
+
+# 两个校验脚本都是**完全离线**的：不依赖 DSH 安装、不联网、不需要构建。
+# 所以这里可以在干净容器里跑，而且能覆盖 Windows 之外的平台。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: smoke + packaging (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 插件是手写 bundle，没有构建步骤；在多平台跑是为了证明
+        # 行尾（.gitattributes 锁 LF）、路径派生、`import.meta` 用法都不依赖 Windows。
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Offline smoke suite
+        run: node tools/smoke.mjs
+
+      - name: Packaging self-check
+        # 不依赖任何 DSH 安装：只校验清单、patch 文件与两份入口的形状。
+        run: node tools/verify-install.mjs --package
