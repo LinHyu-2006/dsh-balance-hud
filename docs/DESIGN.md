@@ -472,9 +472,11 @@ and the fact that a wrong price is worse than an old one.
 ### 7.1 The fetch lives on the Host half
 
 `PRICING_DOC_URL` is `https://api-docs.deepseek.com/zh-cn/quick_start/pricing`, and it is the **only**
-external host the plugin ever contacts. The browser half never talks to it: the client calls two
-further read-only loopback routes — one to trigger a sync, one to list the models DSH has registered —
-and the Host half does the `fetch`.
+external host the plugin ever contacts. The browser half never talks to it: the client calls
+`syncPrices()` against the loopback route `PRICING_ROUTE` (`/api/balance-hud/pricing`) and lists models
+through `MODELS_ROUTE` (`/api/balance-hud/models`), and the Host half does the `fetch`. The Host also
+holds `PRICING_HOST = 'api-docs.deepseek.com'` and builds the URL itself — the route accepts conditional
+validators, never a caller-supplied URL, so it cannot be turned into an open proxy.
 
 Three reasons, in order of weight:
 
@@ -487,10 +489,16 @@ Three reasons, in order of weight:
    origin, referrer). A Node-side `fetch` from the Host half is a plain server request with none of
    that.
 3. **The model list needs no network at all.** DSH's own `llm` service exposes the registered models
-   and providers, so "which models can be priced?" is a loopback-only read.
+   and providers (`listProviders()` / `listModels(id)`), so "which models can be priced?" is a
+   loopback-only read. `llm` is an optional dependency: when it is absent the route returns an empty
+   catalog and the client falls back to its built-in model choices.
 
-The request carries `If-None-Match` with the stored `ETag` (plus `Last-Modified`), so an unchanged page
-answers **`304 Not Modified` with no body** — a few hundred bytes per poll.
+The conditional request is split across the boundary: the client sends the cached `etag` /
+`lastModified` as **query parameters** to the loopback route (they are the loopback owner's own data,
+and the route stays a plain `GET`), and the Host turns them into `If-None-Match` / `If-Modified-Since`
+headers on the outbound request. An unchanged page therefore answers **`304 Not Modified` with no
+body** — a few hundred bytes per poll — and `syncPrices()` only refreshes the cache's `checkedAt`
+timestamp instead of replacing the table.
 
 ### 7.2 The encoding trap, and why every judgement is encoding-independent
 
@@ -540,26 +548,31 @@ noise row fails `peak > off`, and the next start is tried.
 
 ### 7.5 Cache keys and provenance
 
-`saveSyncedPrices` / `loadSyncedPrices` use the `localStorage` key `dsh-balance-hud:prices:v1`
-(`PRICES_CACHE_KEY`), holding the parsed `models` **plus the HTTP validators and a capture timestamp** —
-the validators are what turn the next poll into a 304 instead of a full transfer. The read is wrapped in
-`try/catch` like every other storage access, so a corrupt cache degrades to the built-in table.
+`savePriceCache` / `loadPriceCache` use the `localStorage` key `dsh-balance-hud:prices:v1`
+(`PRICES_CACHE_KEY`), holding `{ models, capturedAt, checkedAt, etag, lastModified, source }` — the
+parsed table **plus the HTTP validators and timestamps**. The validators are what turn the next poll
+into a 304 instead of a full transfer, and `checkedAt` (when we last looked) is kept deliberately
+separate from `capturedAt` (when the table was actually fetched). The read is wrapped in `try/catch`
+like every other storage access, so a corrupt cache degrades to the built-in table.
 
-`resolvePrices(synced)` merges: synced models win **per model**, and built-in models the sync did not
-cover survive, so neither an added nor a retired official model can empty the table. It returns
-`{ prices, source: 'synced' | 'builtin', capturedAt }`, and the settings row surfaces the source and the
-date — the built-in `BUILTIN_PRICES_DATE` (`2026-09-29`), or the sync timestamp. A stale price silently
-stamped as current is exactly the failure this provenance prevents.
+`resolvePrices(priceCache)` merges: synced models win **per model**, and built-in models the sync did
+not cover survive, so neither an added nor a retired official model can empty the table. It returns
+`{ prices, source: 'synced' | 'builtin', capturedAt }`, and the row renders the source and the date —
+`当前价格：内置表（2026-09-29）` (`BUILTIN_PRICES_DATE`) or `当前价格：已同步（YYYY-MM-DD）`. A stale
+price silently stamped as current is exactly the failure this provenance prevents.
 
 ### 7.6 Why the default is off
 
 The plugin's privacy claim is that it adds no network traffic of its own, and a balance HUD is not a
 component anyone expects to start talking to an external host merely because it was installed. So the
-shipped state is `off`: nothing is fetched until the user presses **`Sync prices`** or deliberately
-selects an auto-sync interval (`off` / 6 h / 24 h / 3 d / 7 d). When auto-sync is enabled, **24 h is the
-default interval**, because the changelog announces a price change before the page changes — a
-months-scale event — while the 304 path makes a daily poll nearly free. Off by default also keeps the
-offline smoke suite honest: nothing in the test path can quietly start depending on the network.
+shipped state is `off`: `defaultSettings()` carries `syncHours: 0`, the interval effect returns early
+for `hours <= 0`, and `normalizeSettings` whitelists the field against
+`SYNC_INTERVAL_HOURS = [0, 6, 24, 72, 168]` (`off` / 6 h / 24 h / 3 d / 7 d). Nothing is fetched until
+the user presses **`Sync prices`** (`同步价格`) or deliberately selects an interval.
+`DEFAULT_SYNC_HOURS = 24` records the cadence to use once auto-sync is on: the changelog announces a
+price change before the page changes — a months-scale event — while the 304 path makes a daily poll
+nearly free. Off by default also keeps the offline smoke suite honest: nothing in the test path can
+quietly start depending on the network.
 
 ---
 
@@ -578,7 +591,7 @@ offline smoke suite honest: nothing in the test path can quietly start depending
   events). The fetch mock throws on any URL other than the plugin's own routes and on any method other than
   `GET` — a regression guard for the relay contract, and for the rule that the client half never reaches a
   non-loopback host (§7.1).
-- It prints one `✓` line per check (64 of them) and throws on the first failure.
+- It prints one `✓` line per check (71 of them) and throws on the first failure.
 
 Regression guards worth knowing, because each encodes a deliberate decision:
 

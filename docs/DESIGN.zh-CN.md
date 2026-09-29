@@ -449,8 +449,10 @@ store 一变就 `bumpEpoch()`。
 ### 7.1 抓取为什么放在 Host 半边
 
 `PRICING_DOC_URL` 是 `https://api-docs.deepseek.com/zh-cn/quick_start/pricing`，
-也是插件唯一会访问的外部主机。浏览器半边从不直接访问它：客户端只调两条新的只读回环路由 ——
-一条触发同步、一条列出 DSH 已注册的模型 —— 由 Host 半边执行 `fetch`。
+也是插件唯一会访问的外部主机。浏览器半边从不直接访问它：客户端调 `syncPrices()` 走回环路由
+`PRICING_ROUTE`（`/api/balance-hud/pricing`），调 `MODELS_ROUTE`（`/api/balance-hud/models`）
+列模型，由 Host 半边执行 `fetch`。Host 侧还写死 `PRICING_HOST = 'api-docs.deepseek.com'` 并自己
+拼 URL —— 这条路由只接受条件请求校验值，**不接受调用方传 URL**，因此不可能被当成任意 URL 代理。
 
 三个理由，按重要性排序：
 
@@ -460,11 +462,14 @@ store 一变就 `bumpEpoch()`。
 2. **没有 CORS，也没有浏览器策略面。** 从客户端半边发跨源 `fetch` 会依赖文档站的 CORS 头，
    而且请求跑在用户的浏览器会话里（cookie、origin、referrer）。Host 半边的 Node 侧 `fetch`
    就是一个普通的服务端请求，这些都不存在。
-3. **模型列表根本不需要网络。** DSH 自己的 `llm` 服务本来就暴露了已注册的模型与 provider，
-   所以「哪些模型有价」是一次纯回环读取。
+3. **模型列表根本不需要网络。** DSH 自己的 `llm` 服务本来就暴露了已注册的模型与 provider
+   （`listProviders()` / `listModels(id)`），所以「哪些模型有价」是一次纯回环读取。
+   `llm` 是可选依赖：拿不到时路由返回空目录，客户端回落到内置的模型选项。
 
-请求带 `If-None-Match` 和已存的 `ETag`（以及 `Last-Modified`），页面没变就回
-**`304 Not Modified` 且没有响应体** —— 每次轮询只有几百字节。
+条件请求被拆在两侧：客户端把缓存里的 `etag` / `lastModified` 作为**查询参数**交给回环路由
+（这是回环持有者自己的数据，而且让路由保持成一个普通 `GET`），Host 再把它变成发出请求上的
+`If-None-Match` / `If-Modified-Since` 头。页面没改就回 **`304 Not Modified` 且没有响应体** ——
+每次轮询只有几百字节 —— 此时 `syncPrices()` 只刷新缓存里的 `checkedAt` 时间，不替换价格表。
 
 ### 7.2 编码陷阱，以及为什么每个判断都与编码无关
 
@@ -508,32 +513,35 @@ store 一变就 `bumpEpoch()`。
 
 ### 7.5 缓存键与来源标识
 
-`saveSyncedPrices` / `loadSyncedPrices` 用的 `localStorage` 键是
-`dsh-balance-hud:prices:v1`（`PRICES_CACHE_KEY`），里面存解析出的 `models`，
-**外加 HTTP 校验器与抓取时间戳** —— 校验器正是让下一次轮询变成 304、而不是整页重传的东西。
+`savePriceCache` / `loadPriceCache` 用的 `localStorage` 键是
+`dsh-balance-hud:prices:v1`（`PRICES_CACHE_KEY`），里面是
+`{ models, capturedAt, checkedAt, etag, lastModified, source }` —— 解析出的价格表，
+**外加 HTTP 校验器与时间戳**。校验器正是让下一次轮询变成 304、而不是整页重传的东西；
+`checkedAt`（上次检查时间）与 `capturedAt`（价格表真正抓取的时间）刻意分开保存。
 读取和其他存储访问一样包在 `try/catch` 里，缓存损坏就退回内置表。
 
-`resolvePrices(synced)` 做合并：同步来的模型**按模型**优先，同步没覆盖到的内置模型保留下来，
+`resolvePrices(priceCache)` 做合并：同步来的模型**按模型**优先，同步没覆盖到的内置模型保留下来，
 所以官方新增或下架模型都不会把表弄空。它返回
-`{ prices, source: 'synced' | 'builtin', capturedAt }`，设置行把来源和日期显示出来 ——
-内置表的 `BUILTIN_PRICES_DATE`（`2026-09-29`），或同步时间戳。
+`{ prices, source: 'synced' | 'builtin', capturedAt }`，设置行把来源和日期渲染出来 ——
+`当前价格：内置表（2026-09-29）`（`BUILTIN_PRICES_DATE`）或 `当前价格：已同步（YYYY-MM-DD）`。
 把过期价格悄悄标成当前价格，正是这套来源标识要防的事故。
 
 ### 7.6 为什么默认是关
 
 插件的隐私承诺是「不自己增加网络流量」，而余额 HUD 也不是那种「装上就会去连外部主机」的组件。
-所以出厂状态是 `off`：用户不按 **`Sync prices`**、也不主动选自动同步间隔
-（`off` / 6 小时 / 24 小时 / 3 天 / 7 天）之前，什么都不会抓。开启自动同步后
-**默认间隔是 24 小时** —— 因为 changelog 会先预告调价、价格页之后才改，这是「几个月一次」的事件，
-而 304 让每天一次的轮询几乎不花成本。默认关还有一个好处：离线冒烟套件里没有任何路径能悄悄开始
-依赖网络。
+所以出厂状态是 `off`：`defaultSettings()` 里 `syncHours: 0`，间隔 effect 在 `hours <= 0` 时直接
+返回，`normalizeSettings` 用 `SYNC_INTERVAL_HOURS = [0, 6, 24, 72, 168]`
+（`off` / 6 小时 / 24 小时 / 3 天 / 7 天）逐字段白名单校验。用户不按 **`同步价格`**、
+也不主动选间隔之前，什么都不会抓。`DEFAULT_SYNC_HOURS = 24` 记录的是开启自动同步后应该用的节奏：
+changelog 会先预告调价、价格页之后才改，这是「几个月一次」的事件，而 304 让每天一次的轮询几乎不花
+成本。默认关还有一个好处：离线冒烟套件里没有任何路径能悄悄开始依赖网络。
 
 ---
 
 ## 8. 测试策略
 
 ```bash
-node tools/smoke.mjs                      # 离线，64 条断言，不需要装 DSH
+node tools/smoke.mjs                      # 离线，71 条断言，不需要装 DSH
 node tools/verify-install.mjs --package   # 打包自检（清单 / patch / 两份入口）
 node tools/verify-install.mjs             # 校验真实安装
 ```
@@ -581,7 +589,7 @@ node tools/verify-install.mjs             # 校验真实安装
 - **两个噪声行不得进表**：上下文长度行（`1M`）与紧随价格区段的并发限制行都不能被算成价格；
   价格区段靠「枚举连续六行、取第一个通过校验的组合」定位（§7.4 —— 并发行会把区段撑到 7 行）
 - **峰时价必须严格大于闲时价**，否则整次同步作废、保留上一份好表，**绝不用半解析结果算钱**（§7.3）
-- **同步默认关闭**：默认配置下不得产生任何到价格页的请求；只有按了 `Sync prices` 或主动选了同步
+- **同步默认关闭**：默认配置下不得产生任何到价格页的请求；只有按了 `同步价格` 或主动选了同步
   间隔才会跑（§7.6，也是两个 README 的隐私承诺）
 - **同步缓存的落盘往返**保留 `models`、`capturedAt` 与 HTTP 校验器，且 `resolvePrices`
   如实给出 `source` 与 `capturedAt`（§7.5 —— 304 依赖校验器活下来）
@@ -597,7 +605,7 @@ node tools/verify-install.mjs             # 校验真实安装
 | 位置 | 内容 |
 | --- | --- |
 | `lib/client.js` → `PRICES` / `isPeakHour` / `costOf` | 价格表与四类计价 |
-| `lib/client.js` → `parsePricingPage` / `resolvePrices` / `loadSyncedPrices` / `saveSyncedPrices` / `BUILTIN_PRICES_DATE` / `PRICES_CACHE_KEY` | 价格同步：编码无关解析、语义校验、来源标识（§7） |
+| `lib/client.js` → `parsePricingPage` / `resolvePrices` / `loadPriceCache` / `savePriceCache` / `syncPrices` / `readModels` / `BUILTIN_PRICES_DATE` / `PRICES_CACHE_KEY` / `SYNC_INTERVAL_HOURS` / `DEFAULT_SYNC_HOURS` | 价格同步：编码无关解析、语义校验、条件请求、来源标识（§7） |
 | `lib/client.js` → `formatMoney` / `formatCostShort` / `formatCost` | 2 位 / 4 位显示与哨兵 |
 | `lib/client.js` → `readBalance` / `readBonuses` | 两条回环路由的客户端封装 |
 | `lib/client.js` → `readStore` / `writeStore` / `classifyRead` / `previousBalanceOf` / `observeRead` / `applyExternalChange` | 记账核心（纯逻辑，好测） |

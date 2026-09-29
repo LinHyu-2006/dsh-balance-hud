@@ -28,7 +28,7 @@ DeepSeek **account balance** and the **cost of the current session**.
 
 ```bash
 node tools/install.mjs    # install into ~/.dsh/profiles/desktop, then restart DSH
-node tools/smoke.mjs      # offline smoke suite (64 assertions), no DSH install needed
+node tools/smoke.mjs      # offline smoke suite (71 assertions), no DSH install needed
 ```
 
 ## The HUD
@@ -363,8 +363,8 @@ external host it ever contacts.
 
 **Two ways to trigger a sync, both deliberate:**
 
-- the **`同步价格`** (`Sync prices`) button in the settings row, which syncs once, immediately;
-- the **`自动同步价格`** selector (auto-sync interval), whose options are `off` / `6 h` / `24 h` /
+- the **`Sync prices`** (`同步价格`) button in the settings row, which syncs once, immediately;
+- the **auto-sync interval** (`自动同步价格`), whose options are `off` / `6 h` / `24 h` /
   `3 d` / `7 d` (`不自动（只手动）` / `每 6 小时` / `每 1 天` / `每 3 天` / `每 7 天`). Auto-sync does not
   run until you pick an interval. The shipped state is `off` (`syncHours: 0`): install the plugin and
   never touch these controls, and it still makes **zero external requests**. Once you turn auto-sync
@@ -429,7 +429,7 @@ node tools/verify-install.mjs             # verify a real installation
 
 `tools/smoke.mjs` evaluates the real `lib/client.js` against a fake React runtime, fake host
 responses, a fake `localStorage` and a fake `document`, then drives the component through its hook
-cycle. It prints one `✓` line per check (64 in total) and exits non-zero on the first failure,
+cycle. It prints one `✓` line per check (71 in total) and exits non-zero on the first failure,
 covering module/slot registration, the card layout, hover and fold interaction, the balance
 protocol and every route failure mode, pricing arithmetic, display precision, the external-change
 classifier (top-ups **and** bonus expiry), persistence and the migration chain, and

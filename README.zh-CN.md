@@ -8,7 +8,7 @@
 
 ```bash
 node tools/install.mjs    # 安装到 ~/.dsh/profiles/desktop，然后重启 DSH
-node tools/smoke.mjs      # 离线冒烟套件（64 条断言），不需要装 DSH
+node tools/smoke.mjs      # 离线冒烟套件（71 条断言），不需要装 DSH
 ```
 
 - **账户余额** —— 充值余额 + 赠金余额，走的是「设置 → 账号与余额」同一个服务
@@ -244,8 +244,8 @@ node tools/smoke.mjs      # 离线冒烟套件（64 条断言），不需要装 
   每 60 秒轮询一次                               │
   fetch ──────────────────────────────────────► GET /api/balance-hud/balance   （只读）
                                                 GET /api/balance-hud/bonuses   （只读）
-                                                GET /api/balance-hud/…         （价格同步，需主动开启）
-                                                GET /api/balance-hud/…         （模型列表，仅回环）
+                                                GET /api/balance-hud/pricing   （价格同步，需主动开启）
+                                                GET /api/balance-hud/models    （模型列表，仅回环）
                                                 └─► ctx.deepseekAccount.getBalance()
                                                     ctx.deepseekAccount.getUnnotifiedBonuses()
                                                      └─► 官方 account platform
@@ -294,7 +294,7 @@ node tools/smoke.mjs      # 离线冒烟套件（64 条断言），不需要装 
 
 **两种触发方式，都必须由你主动选择：**
 
-- 设置行里的 **`同步价格`** 按钮：点一次，立刻同步一次；
+- 设置行里的 **`同步价格`** 按钮（英文名 `Sync prices`）：点一次，立刻同步一次；
 - **`自动同步价格`** 下拉：选项是 `不自动（只手动）` / `每 6 小时` / `每 1 天` / `每 3 天` / `每 7 天`
   （即 `off` / 6 小时 / 24 小时 / 3 天 / 7 天）。不选间隔就不会自动跑，出厂状态是「不自动」
   （`syncHours: 0`）—— 装上插件后不碰这些控件，插件**一个外部请求都不会发**。
@@ -357,7 +357,7 @@ node tools/verify-install.mjs             # 校验真实安装
 
 `tools/smoke.mjs` 会在假的 React 运行时、假 Host 响应、假 `localStorage` 和假 `document`
 上求值真实的 `lib/client.js`，然后驱动组件走完整个 hook 周期。每项检查打印一行 `✓`
-（共 64 条），首个失败即非零退出；覆盖模块/槽位注册、卡片布局、悬停与折叠交互、
+（共 71 条），首个失败即非零退出；覆盖模块/槽位注册、卡片布局、悬停与折叠交互、
 余额协议与全部路由失败模式、价格算术、显示精度、**充值/过期两类外部变动判据**、
 持久化与迁移链，以及可见性驱动的补读。A1–A3 三个新功能各有守卫：**两个**槽位注册
 （浮层 **和** 设置行）、设置默认值、脏配置的逐字段收敛、配置落盘往返、容器广播 + 部分合并 +
@@ -387,7 +387,7 @@ CI（`.github/workflows/ci.yml`）在 **ubuntu / windows / macos** 上用 Node 2
 
 - **默认：零外部请求。** 装上插件后不碰价格同步的控件，插件新增的网络流量就只有到
   `/api/balance-hud/…` 的回环 HTTP；它用内置价格表，不接触任何第三方。
-- **唯一的例外是可选的价格同步。** 只有你点了 **`Sync prices`**，或**主动**选了自动同步间隔之后，
+- **唯一的例外是可选的价格同步。** 只有你点了 **`同步价格`**，或**主动**选了自动同步间隔之后，
   插件才会按你选的节奏去抓
   `https://api-docs.deepseek.com/zh-cn/quick_start/pricing` —— 官方的公开价格文档页。
   这是它涉及的**唯一**外部主机，而且抓取由 Host 半边执行，不由浏览器发起（见 [架构](#架构)）。
