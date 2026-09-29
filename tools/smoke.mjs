@@ -708,7 +708,7 @@ console.log('✓ 再次点击：恢复展开');
 //     这是用户原始诉求："只改变余额不改变花费，让花费正常运行"
 {
   const topupRun = await mount({ usage: USAGE, balance: 43.42 });
-  const { observeRead, readStore, sessionSpentOf, reanchorAll, classifyRead } = topupRun.plugin.__test;
+  const { observeRead, readStore, sessionSpentOf, applyExternalChange, classifyRead } = topupRun.plugin.__test;
   const store0 = readStore();
 
   // 首次读数：定锚 43.42
@@ -739,7 +739,7 @@ console.log('✓ 再次点击：恢复展开');
 
   // 手动兜底（方案 C）：同样只抬锚点、不动计数
   const beforeManual = sessionSpentOf(readStore(), SESSION_ACTIVE);
-  reanchorAll(100, 0, SESSION_ACTIVE);
+  applyExternalChange(100, 0, SESSION_ACTIVE, 'topup');
   const afterManual = sessionSpentOf(readStore(), SESSION_ACTIVE);
   if (Math.abs(beforeManual - afterManual) > 1e-9) throw new Error('手动标记不得改变计数');
   console.log(`✓ 手动兜底「我刚充值了」：计数保持 ¥${afterManual.toFixed(2)}`);
@@ -749,7 +749,7 @@ console.log('✓ 再次点击：恢复展开');
 // 4g) 多会话：充值要把**所有**会话的锚点一起抬，否则别的会话会把充值当消费
 {
   const multi = await mount({ usage: USAGE, balance: 50 });
-  const { observeRead, readStore, sessionSpentOf, reanchorAll } = multi.plugin.__test;
+  const { observeRead, readStore, sessionSpentOf, applyExternalChange } = multi.plugin.__test;
   observeRead(SESSION_ACTIVE, 50, 0);
   observeRead(SESSION_IDLE, 49.5, 0.5);
   observeRead(SESSION_ACTIVE, 49, 0.5);
@@ -757,7 +757,7 @@ console.log('✓ 再次点击：恢复展开');
   const bBefore = sessionSpentOf(readStore(), SESSION_IDLE);
 
   // 充值：99 → 所有锚点都必须抬到 99
-  reanchorAll(99, 49, SESSION_ACTIVE);
+  applyExternalChange(99, 49, SESSION_ACTIVE, 'topup');
   const st = readStore();
   for (const [id, entry] of Object.entries(st.sessions)) {
     if (Math.abs(entry.baseline - 99) > 1e-9) throw new Error(`${id} 的锚点未抬到 99：${entry.baseline}`);
@@ -828,11 +828,12 @@ const fallback = await mount({ usage: USAGE, withSessionsShare: false });
 expectIncludes('无框架 share 的回落路径', textOf(fallback.tree), ['余额', '¥43.42']);
 
 // 8) 账户级基线（v3）：每条锚点都是"该会话首见时的账户余额"，账户级 = Σ锚点 − 当前余额
+// 8a) 首次读数定锚；消费累计；跨"刷新"存活
 // 8) 基线表（v4）：按会话存锚点 + **累计花费计数**，充值只抬锚点不改计数
 //    · 跨刷新存活、切走切回不清零
 //    · v3 / v2 / v1 老数据自动迁移
 //    · 过期与超量淘汰、无 localStorage 降级
-const { readStore, loadTracker, createTracker, checkoutSession, observeRead, reanchorAll, accountLevelDelta, sessionSpentOf } = normal.plugin.__test;
+const { readStore, loadTracker, createTracker, checkoutSession, observeRead, applyExternalChange, accountLevelDelta, sessionSpentOf } = normal.plugin.__test;
 const storage = installStorageMock();
 const KEY = 'dsh-balance-hud:tracker:v4';
 const sessionA = SESSION_ACTIVE;
@@ -840,7 +841,84 @@ const sessionB = SESSION_IDLE;
 /** 取当前基线表。 */
 const store = () => readStore();
 
-// 8a) 首次读数定锚；消费累计；跨"刷新"存活
+// 8-0) **赠金时效性**：过期回收不可计入花费
+//      赠金到期会被平台收回，表现为余额凭空下降却没有对应消费。
+//      判据与充值对称：降幅超过 token 估算上界 → 外部减钱，只下移锚点、不动计数。
+{
+  const { classifyRead } = normal.plugin.__test;
+
+  // 纯判据
+  if (classifyRead(43.0, 38.0, 0.5).kind !== 'expire') {
+    throw new Error(`降幅远超 token 上界应判为 expire：${JSON.stringify(classifyRead(43.0, 38.0, 0.5))}`);
+  }
+  if (classifyRead(43.0, 42.5, 0.5).kind !== 'spend') {
+    throw new Error(`降幅在上界内仍应算消费：${JSON.stringify(classifyRead(43.0, 42.5, 0.5))}`);
+  }
+  // 边界：降幅正好等于上界 → 仍算消费（不能把正常消费误判成回收）
+  if (classifyRead(43.0, 42.5, 0.5).kind !== 'spend') {
+    throw new Error('降幅等于上界时应算消费');
+  }
+  console.log('✓ 赠金过期判据：降幅 > token 上界 → expire，否则仍算消费');
+
+  // 记账：过期不加计数、只下移锚点，之后继续正常累计
+  storage.clear();
+  observeRead(sessionA, 43.0, 0); // 定锚 43.00
+  observeRead(sessionA, 42.4, 0.6); // 正常消费 0.60
+  const beforeExpire = sessionSpentOf(store(), sessionA);
+  if (Math.abs(beforeExpire - 0.6) > 1e-9) throw new Error(`消费后应为 0.60：${beforeExpire}`);
+
+  // 5 元赠金过期：43 → 37.4，期间 token 估值只有 0.1
+  const verdict = observeRead(sessionA, 37.4, 0.1);
+  if (verdict.kind !== 'expire') throw new Error(`应识别为过期回收：${verdict.kind}`);
+  const afterExpire = sessionSpentOf(store(), sessionA);
+  if (Math.abs(afterExpire - beforeExpire) > 1e-9) {
+    throw new Error(`过期回收绝不能改变花费计数：${beforeExpire} → ${afterExpire}`);
+  }
+  if (Math.abs(store().sessions[sessionA].baseline - 37.4) > 1e-9) {
+    throw new Error(`过期后锚点应下移到 37.4：${store().sessions[sessionA].baseline}`);
+  }
+  console.log(`✓ 赠金过期 ¥5.00：计数保持 ¥${afterExpire.toFixed(2)}，锚点下移到 ¥37.40`);
+
+  // 过期之后继续消费，仍要正常累计
+  observeRead(sessionA, 37.0, 0.4);
+  const afterResume = sessionSpentOf(store(), sessionA);
+  if (Math.abs(afterResume - 1.0) > 1e-9) {
+    throw new Error(`过期后应继续累计到 1.00：${afterResume}`);
+  }
+  console.log(`✓ 过期后花费继续累计：¥${afterResume.toFixed(2)}`);
+
+  // 过期要把**所有**会话的锚点一起下移（余额是账户级的），且各会话计数都不变。
+  // 用一个真实的共享余额序列，这样也能顺带钉住"previous 取哪一次读数"的正确性：
+  // A 读过 44 之后，B 再读 43 必须和**B 自己的**上次读数（48.5）比，
+  // 而不是和 A 刚写下的全局读数（44）比 —— 后者会把 B 这 5.5 元的真实消费算丢。
+  storage.clear();
+  observeRead(sessionA, 50, 0); // A 定锚 50
+  observeRead(sessionB, 48.5, 1.5); // B 首读，定锚 48.5
+  observeRead(sessionB, 48.5, 1.5); // B 自己的"上次读数"落定
+  const bBefore = sessionSpentOf(store(), sessionB);
+
+  observeRead(sessionA, 44, 0.1); // 大幅下降且超出 token 上界 → expire
+  const aAfterExpire = sessionSpentOf(store(), sessionA);
+
+  // 所有会话的锚点同步下移到 44
+  for (const [id, entry] of Object.entries(store().sessions)) {
+    if (Math.abs(entry.baseline - 44) > 1e-9) throw new Error(`${id} 的锚点未下移到 44：${entry.baseline}`);
+  }
+  if (Math.abs(aAfterExpire) > 1e-9) throw new Error(`A 的计数被过期改动了：${aAfterExpire}`);
+
+  // B 的真实现金流：48.5 → 43.0。上界必须 ≥ 实际消费额，否则按判据会被当成外部减钱 ——
+  // 现实中这 5.5 元正是对应 token 花掉的，所以上界取 5.5（对应它这段时间的 token 成本）。
+  observeRead(sessionB, 43, 5.5);
+  const bAfter = sessionSpentOf(store(), sessionB);
+  if (Math.abs(bAfter - (bBefore + 5.5)) > 1e-9) {
+    throw new Error(`B 应累计到 ${(bBefore + 5.5).toFixed(2)}（上次读数 48.5 → 43），实际 ${bAfter}`);
+  }
+  console.log(
+    `✓ 过期下移所有锚点（A 计数 ¥${aAfterExpire.toFixed(2)} 不变）；B 仍按自己的上次读数累计到 ¥${bAfter.toFixed(2)}`
+  );
+}
+
+
 storage.clear();
 observeRead(sessionA, 50, 0);
 if (Math.abs(store().sessions[sessionA].baseline - 50) > 1e-9) throw new Error(`A 未定锚：${JSON.stringify(store())}`);
