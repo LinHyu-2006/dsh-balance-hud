@@ -16,9 +16,12 @@ DeepSeek **account balance** and the **cost of the current session**.
 - **Per session** — the tracker is keyed by session id; refreshing the page or switching sessions
   never damages or clobbers another session's record, because the read → modify → write round trip
   is lossless.
-- **No credentials, no outbound network of its own** — the plugin never touches your API key.
-- **Two halves, one relay** — a browser half renders the HUD; a Host half exposes two read-only
-  loopback HTTP routes so the browser can read the balance.
+- **No credentials, and no outbound network unless you opt in** — the plugin never touches your API
+  key. It reaches the network only after you turn price syncing on (see
+  [Prices and syncing](#prices-and-syncing)); until then it makes zero external requests.
+- **Two halves, one relay** — a browser half renders the HUD; a Host half exposes read-only loopback
+  HTTP routes (balance, bonus signal, price sync, model list), so the browser itself never talks to
+  anything but loopback.
 - **Configurable, and budgeted** — a preference row in *Settings → General* sets the model, the poll
   intervals, the budgets and the warnings; the card gains a coloured edge as spending approaches a
   budget, and the panel counts down to the next peak/off-peak switch.
@@ -86,6 +89,7 @@ page.
 | Setting | Values | Default | Effect |
 | --- | --- | --- | --- |
 | Model (`计价模型`) | `deepseek-flash`, `deepseek-v4-pro` | `deepseek-flash` | Price table used for the estimate and the apportionment weights |
+| Price auto-sync interval (`自动同步价格`) | off / 6 h / 24 h / 3 d / 7 d | off | Auto-sync cadence for the official price table; nothing runs until you pick one (see [Prices and syncing](#prices-and-syncing)) |
 | Foreground poll interval (`前台刷新间隔`) | 30 / 60 / 120 / 300 s | 60 s | Balance poll cadence while the page is visible |
 | Hidden interval (`后台（页面隐藏）`) | 30 / 60 / 120 / 300 s | 300 s | Balance poll cadence while the page is hidden |
 | Peak-warning lead time (`峰前提醒`) | 5 / 10 / 15 / 30 min | 10 min | How early the peak/off-peak warning appears |
@@ -287,10 +291,11 @@ refetched immediately when the page becomes visible, and retried on failure with
 10s → 20s backoff. Not being logged in is not an error and does not trigger the fast retry. Both
 intervals are configurable in the settings row (see [Settings](#settings)).
 
-Two more keys exist alongside the accounting one, and they are **independent** of it:
-`dsh-balance-hud:settings:v1` (the preference row, see [Settings](#settings)) and
-`dsh-balance-hud:daily:v1` (the Beijing-day ledger, see [Budgets](#budgets)). Clearing or corrupting
-one never affects the others.
+Three more keys exist alongside the accounting one, and they are **independent** of it:
+`dsh-balance-hud:settings:v1` (the preference row, see [Settings](#settings)),
+`dsh-balance-hud:daily:v1` (the Beijing-day ledger, see [Budgets](#budgets)) and
+`dsh-balance-hud:prices:v1` (the synced price table plus its validators, see
+[Prices and syncing](#prices-and-syncing)). Clearing or corrupting one never affects the others.
 
 ## Architecture
 
@@ -300,9 +305,13 @@ browser (client half, lib/client.js)          host (Host half, lib/index.js)
   polls every 60 s                              │
   fetch ──────────────────────────────────────► GET /api/balance-hud/balance   (read-only)
                                                 GET /api/balance-hud/bonuses   (read-only)
+                                                GET /api/balance-hud/pricing   (price sync, opt-in)
+                                                GET /api/balance-hud/models    (model list, loopback only)
                                                 └─► ctx.deepseekAccount.getBalance()
                                                     ctx.deepseekAccount.getUnnotifiedBonuses()
-                                                     └─► official account platform
+                                                      └─► official account platform
+                                                    fetch(PRICING_DOC_URL)   ← opt-in sync only
+                                                      └─► official pricing docs
 ```
 
 **Why the relay exists.** The browser half cannot call `ctx.remote.account.getBalance` directly:
@@ -310,9 +319,10 @@ accessing it without declaring it throws
 `cannot get property "remote.account" without inject`, and declaring `inject = ["remote"]` on the
 client half cannot be satisfied — the fiber hangs forever and the plugin never activates. Both were
 reproduced against real `@deepseek-ai/cordis` 4.0.4, so the Host half reads the balance and hands it
-to the browser over a loopback-only, read-only route. Both routes accept **loopback sources only**
+to the browser over a loopback-only, read-only route. All routes accept **loopback sources only**
 (`127.0.0.1`, `::1`, IPv4-mapped loopback forms) and answer `403` to anything else; they are
-`GET`-only, never mutate state, never return credentials, and send `cache-control: no-store`.
+`GET`-only, never mutate state, never return credentials, and send `cache-control: no-store`. One of
+them can cause an outbound request — the opt-in price sync — and only once the user has asked for it.
 
 | Payload | Meaning | HUD shows |
 | --- | --- | --- |
@@ -337,8 +347,53 @@ exactly half of peak.
 - **Cache writes** are billed at the cache-miss input rate.
 - The price table holds both models; the **model is a setting** (default `deepseek-flash`), so the
   estimate and the apportionment weights follow your choice. Unknown models fall back to flash prices
-  rather than to zero, and the panel says so. After an official price change, edit `PRICES` and
-  refresh the page.
+  rather than to zero, and the panel says so. After an official price change you can sync the table
+  (see [Prices and syncing](#prices-and-syncing)) or edit `PRICES` and refresh the page.
+- The table above is the **built-in** snapshot, dated **2026-09-29** (`BUILTIN_PRICES_DATE`). Once you
+  have synced, the newer official table is used instead.
+
+## Prices and syncing
+
+The estimate is priced from a table that ships **inside the plugin**. That table is a dated snapshot
+(the built-in table's date is **2026-09-29**), and it stays in use unless you ask the plugin to do
+otherwise. DeepSeek can change prices at any time, so the plugin can also **sync the official price
+table** from
+[the official pricing page](https://api-docs.deepseek.com/zh-cn/quick_start/pricing) — the only
+external host it ever contacts.
+
+**Two ways to trigger a sync, both deliberate:**
+
+- the **`同步价格`** (`Sync prices`) button in the settings row, which syncs once, immediately;
+- the **`自动同步价格`** selector (auto-sync interval), whose options are `off` / `6 h` / `24 h` /
+  `3 d` / `7 d` (`不自动（只手动）` / `每 6 小时` / `每 1 天` / `每 3 天` / `每 7 天`). Auto-sync does not
+  run until you pick an interval. The shipped state is `off` (`syncHours: 0`): install the plugin and
+  never touch these controls, and it still makes **zero external requests**. Once you turn auto-sync
+  on, **24 h is the default cadence** (`DEFAULT_SYNC_HOURS`) — because DeepSeek announces price
+  changes in its changelog *before* the pricing page changes, so this is a months-scale event, not a
+  daily one. The page is a CDN asset that sends `ETag` and `Last-Modified`, and the sync sends
+  `If-None-Match`, so an unchanged page answers **`304 Not Modified` with no body** — a few hundred
+  bytes per poll. A 24 h cadence bounds the staleness window to a day at almost no cost.
+
+**The Host half performs the fetch, not the browser.** The browser never talks to the pricing host.
+It calls two further read-only loopback routes: `GET /api/balance-hud/pricing` (sync prices) and
+`GET /api/balance-hud/models` (the models DSH has registered). Only the first one can cause an
+outbound request; the second needs no network at all, because it reads DSH's own `llm` service
+(`listProviders()` / `listModels()`). The settings row uses that catalog to fill the pricing-model
+dropdown, falling back to the built-in choices if `llm` is unavailable.
+
+**A wrong table is worse than an old one.** The page is parsed by a pure function that makes every
+judgement **independently of the page's encoding** (the fetch path can hand back UTF-8 bytes decoded
+as Latin-1, which turns the Chinese labels into mojibake) and that **validates semantically**: the
+official rule is "off-peak = half of peak", so the peak price must be strictly greater than the
+off-peak price. If anything fails validation the sync is rejected **wholesale**, and the plugin keeps
+the last good table — built-in or previously synced. A half-parsed table is never used to compute
+money.
+
+**Where it is stored, and what the row tells you.** A synced table is cached in `localStorage` under
+`dsh-balance-hud:prices:v1`, together with the `ETag`, the `Last-Modified` value and a capture
+timestamp; a `304` refreshes the check time without touching the table. The settings row shows
+**which source is in use and from what date** — `当前价格：内置表（2026-09-29）`, or
+`当前价格：已同步（YYYY-MM-DD）` after a successful sync.
 
 ## Install
 
@@ -400,21 +455,34 @@ injection, or the real platform. `lib/client.js` is a hand-written CJS-style bun
 | File | Role |
 | --- | --- |
 | `package.json` + `cordis.patch.yml` | Declare `dsh.bundle.patch` and `dsh.client` (`platform: web`, exports `./client`), and insert the plugin into the profile entry tree |
-| `lib/index.js` | Host half: the two read-only loopback routes |
-| `lib/client.js` | Browser half: the `shell.overlay` HUD, the `settings.general.item` row and all of the accounting |
+| `lib/index.js` | Host half: the read-only loopback routes (balance, bonus signal, opt-in price sync, model list) |
+| `lib/client.js` | Browser half: the `shell.overlay` HUD, the `settings.general.item` row, the price-table parser and all of the accounting |
 | `tools/` | Installer, installation verifier, offline smoke suite |
 | `.github/workflows/ci.yml` | Offline smoke suite + packaging self-check on ubuntu / windows / macos |
 | `docs/DESIGN.md` | Contributor design note — the accounting model in full ([简体中文](docs/DESIGN.zh-CN.md)) |
 
 ## Privacy and security
 
-- **The official API key is never touched by this plugin.** The Host half only calls `getBalance`
-  and `getUnnotifiedBonuses`; it never calls `resolveToken` or `getPlatformSession`, so credentials
-  stay inside `@deepseek-ai/dsh-deepseek-account-platform`.
+- **Default: zero external requests.** Installing the plugin and never touching the price-sync
+  controls adds only loopback HTTP to `/api/balance-hud/…`. The plugin uses its built-in price table
+  and contacts no third party at all.
+- **The one exception is opt-in price syncing.** Only after you click **`Sync prices`** or
+  deliberately select an auto-sync interval does the plugin additionally fetch
+  `https://api-docs.deepseek.com/zh-cn/quick_start/pricing` — the official, public pricing
+  documentation page — on the schedule you chose. That is the **only** external host involved, and
+  the Host half performs the fetch, not the browser (see [Architecture](#architecture)).
+- **What is not sent, ever:** no credentials, no API key, no account id, no session data, no cookies,
+  and no query parameters identifying you. It is a plain `GET` of a public documentation page;
+  syncing neither reads nor transmits your balance.
+- **The official API key is never touched by this plugin.** For account data the Host half only calls
+  `getBalance` and `getUnnotifiedBonuses`; it never calls `resolveToken` or `getPlatformSession`, so
+  credentials stay inside `@deepseek-ai/dsh-deepseek-account-platform`.
 - No secrets, tokens or account ids are stored in the repository, in `localStorage`, or in the HUD.
-- The only network traffic the plugin adds is loopback HTTP to `/api/balance-hud/…`, which rejects
-  non-loopback callers with `403` and returns balance numbers only. It sends nothing to a third
-  party; the Host half's platform call goes through the account service DSH already uses.
+  The synced-price cache (`dsh-balance-hud:prices:v1`) holds prices, the HTTP validators and a
+  timestamp — no account data.
+- The balance, bonuses and model-list routes stay **loopback-only and read-only**: they reject
+  non-loopback callers with `403` and return balance numbers or registered model names only. The
+  plugin's platform calls go through the account service DSH already uses.
 - The bonuses route is read-only *and* non-acking, so it cannot swallow DSH's own bonus
   notifications.
 
@@ -422,6 +490,11 @@ injection, or the real platform. `lib/client.js` is a hand-written CJS-style bun
 
 - **The estimate covers model tokens only.** Any non-token billing item (plugins, retrieval, …)
   would make it too low.
+- **The price table is a dated snapshot.** If you never sync and DeepSeek changes prices, the estimate
+  keeps using the built-in **2026-09-29** table until you sync, or edit `PRICES` and refresh. The
+  parser reads the *current* page structure, so a documentation redesign can make a parse fail — in
+  that case the sync is rejected and the last good table is kept, so the estimate goes stale rather
+  than wrong.
 - **Apportionment is an estimate**, and sessions whose usage projection is not reachable weigh 0 in
   the denominator, which can skew the share.
 - **The platform settles with a delay.** Right after a run the actual figure may still sit at its

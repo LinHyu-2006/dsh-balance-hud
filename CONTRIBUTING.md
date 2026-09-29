@@ -60,6 +60,25 @@ clean containers and proves that line endings (`.gitattributes` pins LF), path d
    stops firing (a broken `ctx.slots.inject`, a renamed slot) cannot pass unnoticed, and so nothing
    takes over a whole settings page by accident. When you legitimately add a third registration, update
    the count in the same commit.
+10. **Any new outbound network destination must be opt-in, named, and documented in both READMEs.**
+    The plugin's default state sends nothing to a third party, and that is the whole substance of the
+    privacy section. Today there is exactly one exception: the opt-in price sync to
+    `https://api-docs.deepseek.com/zh-cn/quick_start/pricing`. A new destination must
+    (a) stay **off** until the user deliberately enables it — a button press or an explicit interval
+    choice, never an install-time default; (b) be stated **with its exact host** in the privacy section
+    of *both* `README.md` and `README.zh-CN.md`, together with what is not sent; and (c) be fetched by
+    the **Host half** through a loopback-only route — never by the browser, and never with a query
+    parameter that identifies the user. "Off by default" is part of the contract, not a nicety: a HUD
+    that silently starts talking to a new host is a privacy regression even if the payload is harmless.
+11. **Anything that feeds a money calculation must validate semantically, not merely parse, and must
+    fall back to the last good data.** A parse that returns plausible numbers in the wrong slots is
+    worse than no parse at all, because nothing in the UI can tell the difference. The price-table
+    parser is the worked example: it checks the official relation (`peak > off`, strictly) for every
+    model and category, and when the check fails it rejects the sync **wholesale** and keeps the
+    built-in or previously synced table. Do not salvage a partial result, do not treat a parse failure
+    as "the price is 0", and do not make a judgement from a human-readable label — the fetch path can
+    hand back UTF-8 bytes decoded as Latin-1, which turns every Chinese label on the page into
+    mojibake. See §7 of `docs/DESIGN.md` (and §7 of `docs/DESIGN.zh-CN.md`).
 
 ## Testing notes
 

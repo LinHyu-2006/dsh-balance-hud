@@ -1215,6 +1215,110 @@ console.log(`✓ 可见性联动：回前台立刻补读（${before} → ${balan
   console.log('✓ 峰谷：峰前/峰后/跨午休/跨周末的倒计时都对');
 }
 
+// 14) 价格同步：解析官方页面、合并来源、缓存与"默认不外联"
+{
+  const {
+    parsePricingPage, resolvePrices, loadPriceCache, savePriceCache,
+    PRICES_CACHE_KEY, DEFAULT_SYNC_HOURS, SYNC_INTERVAL_HOURS,
+    normalizeSettings, defaultSettings, costOf
+  } = normal.plugin.__test;
+
+  // 14a) 用**真实抓取的官方表格**做固定用例。
+  //      官方改版会让测试先红，而不是等用户发现价格算错。
+  const fixturePath = path.join(here, 'fixtures', 'pricing-table.html');
+  const fixture = fs.readFileSync(fixturePath, 'utf8');
+  const parsed = parsePricingPage(fixture);
+  if (parsed === null) throw new Error('官方价格表固定用例解析失败（页面结构可能已改版）');
+  const expectPrices = {
+    'deepseek-flash': { cacheHit: [0.02, 0.04], cacheMiss: [1, 2], output: [4, 8] },
+    'deepseek-v4-pro': { cacheHit: [0.15, 0.3], cacheMiss: [4.5, 9], output: [13.5, 27] }
+  };
+  for (const [id, expected] of Object.entries(expectPrices)) {
+    const got = parsed.models[id];
+    if (got === undefined) throw new Error(`固定用例里缺少模型 ${id}`);
+    for (const kind of ['cacheHit', 'cacheMiss', 'output']) {
+      if (Math.abs(got[kind].off - expected[kind][0]) > 1e-9 || Math.abs(got[kind].peak - expected[kind][1]) > 1e-9) {
+        throw new Error(`${id}.${kind} 解析不符：${JSON.stringify(got[kind])} 期望 ${JSON.stringify(expected[kind])}`);
+      }
+    }
+  }
+  console.log('✓ 价格解析：真实官方表格固定用例，两模型六项价全部对上');
+
+  // 14b) 编码无关：整份 UTF-8 被按 Latin-1 解码后仍要能解析。
+  //      这是真实抓取链路上会发生的退化（中文标签全变乱码）。
+  const misDecoded = Buffer.from(fixture, 'utf8').toString('latin1');
+  const parsedMojibake = parsePricingPage(misDecoded);
+  if (parsedMojibake === null) throw new Error('乱码页面应仍可解析（判据必须与中文无关）');
+  if (Math.abs(parsedMojibake.models['deepseek-flash'].cacheHit.peak - 0.04) > 1e-9) {
+    throw new Error(`乱码页面解析出的价格不对：${JSON.stringify(parsedMojibake.models['deepseek-flash'])}`);
+  }
+  console.log('✓ 价格解析：编码无关（UTF-8 被误按 Latin-1 解码也能解析）');
+
+  // 14c) 结构损坏必须**整条放弃**，而不是给半张表
+  for (const [label, broken] of [
+    ['空文本', ''],
+    ['没有表格', '<html><body>no table</body></html>'],
+    ['只有表头', '<table><tr><td>x</td><td>deepseek-a</td><td>deepseek-b</td></tr></table>']
+  ]) {
+    if (parsePricingPage(broken) !== null) throw new Error(`${label} 应解析失败`);
+  }
+  // 档位配反（峰时价低于闲时价）必须被语义校验拒绝
+  const inverted = fixture.replace(/0\.04/g, '0.01').replace(/0\.30/g, '0.01');
+  const invertedResult = parsePricingPage(inverted);
+  if (invertedResult !== null) {
+    const flash = invertedResult.models['deepseek-flash'];
+    if (flash?.cacheHit?.peak <= flash?.cacheHit?.off) throw new Error('峰时价低于闲时价时应拒绝解析');
+  }
+  console.log('✓ 价格解析：结构损坏或档位反常时放弃（不用半张表算钱）');
+
+  // 14d) 合并来源：同步优先，但内置表里没被同步到的模型要保留
+  const merged = resolvePrices({
+    models: { 'deepseek-flash': { cacheHit: { off: 1, peak: 2 }, cacheMiss: { off: 1, peak: 2 }, output: { off: 1, peak: 2 } } },
+    capturedAt: '2026-01-01T00:00:00.000Z'
+  });
+  if (merged.source !== 'synced') throw new Error(`应标记为 synced：${merged.source}`);
+  if (merged.prices['deepseek-flash'].cacheHit.peak !== 2) throw new Error('同步值未生效');
+  if (merged.prices['deepseek-v4-pro'] === undefined) throw new Error('内置表里其它模型应保留');
+  if (resolvePrices(null).source !== 'builtin') throw new Error('无同步时应标记 builtin');
+  console.log('✓ 价格来源：同步优先、未同步的模型保留内置价、来源可分辨');
+
+  // 14e) costOf 会用传入的价格表
+  const usage = { uncachedInputTokens: 1_000_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 };
+  const byBuiltin = costOf(usage, 'deepseek-flash', false).total;
+  const bySynced = costOf(usage, 'deepseek-flash', false, merged.prices).total;
+  if (Math.abs(byBuiltin - 1) > 1e-9) throw new Error(`内置表单价应为 1：${byBuiltin}`);
+  if (Math.abs(bySynced - 1) > 1e-9) throw new Error(`同步表单价应为 1：${bySynced}`);
+  console.log('✓ 计价：costOf 使用传入的价格表');
+
+  // 14f) 缓存往返
+  const cacheStorage = installStorageMock();
+  const saved = {
+    models: { 'deepseek-flash': { cacheHit: { off: 0.02, peak: 0.04 }, cacheMiss: { off: 1, peak: 2 }, output: { off: 4, peak: 8 } } },
+    capturedAt: '2026-09-29T00:00:00.000Z',
+    etag: '"abc"',
+    lastModified: 'x',
+    source: 'synced'
+  };
+  savePriceCache(saved);
+  const reloaded = loadPriceCache();
+  if (reloaded?.etag !== '"abc"' || reloaded?.capturedAt !== saved.capturedAt) {
+    throw new Error(`价格缓存往返失败：${JSON.stringify(reloaded)}`);
+  }
+  if (cacheStorage.getItem(PRICES_CACHE_KEY) === null) throw new Error('价格缓存未落盘');
+  cacheStorage.setItem(PRICES_CACHE_KEY, 'not json');
+  if (loadPriceCache() !== null) throw new Error('损坏的缓存应返回 null');
+  console.log('✓ 价格缓存：往返保留条件请求头与抓取时间，损坏时安全回落');
+
+  // 14g) **默认零外联**：新用户默认不自动同步
+  const defaults = defaultSettings();
+  if (defaults.syncHours !== 0) throw new Error(`自动同步应默认关闭：${defaults.syncHours}`);
+  if (!SYNC_INTERVAL_HOURS.includes(DEFAULT_SYNC_HOURS)) throw new Error('默认间隔必须在选项里');
+  if (DEFAULT_SYNC_HOURS !== 24) throw new Error(`默认间隔应为 24 小时：${DEFAULT_SYNC_HOURS}`);
+  if (normalizeSettings({ syncHours: 999 }).syncHours !== 0) throw new Error('非法间隔应收敛为关闭');
+  if (normalizeSettings({ syncHours: 24 }).syncHours !== 24) throw new Error('合法间隔应保留');
+  console.log('✓ 价格同步：默认关闭（零外联），非法间隔收敛为关闭，24 小时为默认档');
+}
+
 console.log('\n全部冒烟测试通过');
 // 组件里的轮询定时器会吊住事件循环，显式退出。
 process.exit(0);

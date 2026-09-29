@@ -4,9 +4,9 @@
 
 A contributor's guide to *why* the plugin is built the way it is. Read the
 [README](../README.md) first for what it does; this document covers the constraints and the accounting
-model you must respect when you modify it. The two files that matter are `lib/index.js` (Host half: two
-read-only loopback routes) and `lib/client.js` (browser half: the HUD, pricing, accounting,
-persistence); `tools/smoke.mjs` executes the latter offline.
+model you must respect when you modify it. The two files that matter are `lib/index.js` (Host half: the
+read-only loopback routes, including the opt-in price-sync fetch) and `lib/client.js` (browser half: the
+HUD, pricing, accounting, persistence); `tools/smoke.mjs` executes the latter offline.
 
 ---
 
@@ -34,13 +34,20 @@ GET /api/balance-hud/balance   → normalize(ctx.deepseekAccount.getBalance(...)
 GET /api/balance-hud/bonuses   → normalizeBonuses(ctx.deepseekAccount.getUnnotifiedBonuses(...))
 ```
 
+Two further loopback routes serve the **opt-in price sync** and the **model list**; both are covered in
+§7, and only the former causes an outbound request.
+
 Design rules that follow:
 
 - **The relay is read-only, always**, on a loopback-only route: `isLoopback()` accepts `127.0.0.1`, `::1`,
   IPv4-mapped loopback forms and any `127.*` address; everything else gets `403` with a JSON body.
-- **No credentials cross the boundary.** The Host half calls only `getBalance` and `getUnnotifiedBonuses`;
-  it never calls `resolveToken` or `getPlatformSession`, so the API key stays inside
-  `@deepseek-ai/dsh-deepseek-account-platform`.
+- **One route family, one network destination.** The opt-in price sync (§7) is the only thing in the
+  plugin that reaches a non-loopback host (`PRICING_DOC_URL`); everything else — including the model
+  list, which comes from DSH's own `llm` service — is loopback-only. Keep it that way; CONTRIBUTING
+  makes it a ground rule, because it is the whole substance of the README's privacy section.
+- **No credentials cross the boundary.** For account data the Host half calls only `getBalance` and
+  `getUnnotifiedBonuses`; it never calls `resolveToken` or `getPlatformSession`, so the API key stays
+  inside `@deepseek-ai/dsh-deepseek-account-platform`.
 - **The bonuses route must not ack.** Calling `ackBonusNotified` would mark grants as shown and interfere
   with DSH's own bonus notifications. Reading without acking keeps the data permanently readable, and the
   client de-duplicates by `orderId` instead.
@@ -455,7 +462,108 @@ keeps working.
 
 ---
 
-## 7. Testing strategy
+## 7. Price syncing: opt-in, encoding-independent, self-validating
+
+The price table used for the estimate used to be a constant that only changed when someone edited the
+source. It can now be **synced** from the official pricing page, and every decision on that path is
+shaped by one of three constraints: the plugin's "no network of its own" promise, the page's encoding,
+and the fact that a wrong price is worse than an old one.
+
+### 7.1 The fetch lives on the Host half
+
+`PRICING_DOC_URL` is `https://api-docs.deepseek.com/zh-cn/quick_start/pricing`, and it is the **only**
+external host the plugin ever contacts. The browser half never talks to it: the client calls two
+further read-only loopback routes — one to trigger a sync, one to list the models DSH has registered —
+and the Host half does the `fetch`.
+
+Three reasons, in order of weight:
+
+1. **The Cordis/loopback shape is already there.** §1's relay is Host-side because the client half
+   cannot reach the account service; the same asymmetry applies to any outbound request. Keeping the
+   single network destination in `lib/index.js` means "where can this plugin talk to?" has a one-file
+   answer that a reviewer can audit.
+2. **No CORS and no browser-policy surface.** A cross-origin `fetch` from the client half would depend
+   on the documentation host's CORS headers and would run inside the user's browser session (cookies,
+   origin, referrer). A Node-side `fetch` from the Host half is a plain server request with none of
+   that.
+3. **The model list needs no network at all.** DSH's own `llm` service exposes the registered models
+   and providers, so "which models can be priced?" is a loopback-only read.
+
+The request carries `If-None-Match` with the stored `ETag` (plus `Last-Modified`), so an unchanged page
+answers **`304 Not Modified` with no body** — a few hundred bytes per poll.
+
+### 7.2 The encoding trap, and why every judgement is encoding-independent
+
+The fetch path can hand back UTF-8 bytes decoded as Latin-1. `元` then becomes two mojibake code points
+whose length depends on the decoding step, and every Chinese label on the page (`空闲时段`,
+`高峰时段`, `百万tokens输入`) is scrambled. **A parser whose judgements rest on those labels works
+perfectly against a hand-saved copy of the page and breaks on the real fetch path.**
+
+So nothing in `parsePricingPage` matches Chinese text. The three anchors it does use are all
+encoding-independent:
+
+| Judgement | Anchor | Why it survives any decoding |
+| --- | --- | --- |
+| Which models, and in which column | the model ids in the header row (`deepseek-…`) | the ids are ASCII; only their positions matter |
+| Is this cell a price | "starts with digits, followed by nothing but whitespace and non-digits" | matches `元`, mojibake, or an empty suffix; an explanation cell such as `百万tokens输入` contains letters and is rejected |
+| Which tier is this row | **row order** within the block (first row off-peak, second peak, per category) | the official table layout is fixed, so no label lookup is needed |
+
+Script, style and comment blocks are stripped first, because they contain numbers too.
+
+### 7.3 Semantic validation beats completeness
+
+The official rule is "off-peak = half of peak", so `peak > off` must hold **strictly** for every
+category of every model; validation also requires both tiers to be present, finite and non-negative.
+
+This matters more than completeness. A parse that *misses* a row produces a table with a hole, which is
+visible. A parse that takes the wrong six rows produces no hole at all — it produces **plausible numbers
+attached to the wrong tiers**, and those numbers feed the estimate and the apportionment weights. A
+relation checked against the official rule catches that class of error where a shape or number check
+cannot.
+
+If validation fails, the sync is rejected **wholesale**: the plugin keeps the last good table (built-in,
+or the previously synced one) and never computes money from a partial result. That is why the fallback
+is `resolvePrices`, not "fill in whatever we happened to get".
+
+### 7.4 The two noise rows, and how the block is located
+
+The real page contains rows that *look* like price data exactly where a naive scan picks them up:
+
+- the header's context-length row (`上下文长度 | 1M`), and
+- the concurrency row (`并发限制 | 2500 | 500`) immediately after the price block.
+
+The concurrency row is the nastier one: it makes the price block **seven** rows long, so "take the next
+six rows after the price header" can slide onto it. The parser therefore does not trust fixed offsets. It
+collects every row matching the encoding-independent price-row shape (§7.2), enumerates **contiguous runs
+of six** of them, and keeps the first run that passes the semantic check of §7.3. A run containing either
+noise row fails `peak > off`, and the next start is tried.
+
+### 7.5 Cache keys and provenance
+
+`saveSyncedPrices` / `loadSyncedPrices` use the `localStorage` key `dsh-balance-hud:prices:v1`
+(`PRICES_CACHE_KEY`), holding the parsed `models` **plus the HTTP validators and a capture timestamp** —
+the validators are what turn the next poll into a 304 instead of a full transfer. The read is wrapped in
+`try/catch` like every other storage access, so a corrupt cache degrades to the built-in table.
+
+`resolvePrices(synced)` merges: synced models win **per model**, and built-in models the sync did not
+cover survive, so neither an added nor a retired official model can empty the table. It returns
+`{ prices, source: 'synced' | 'builtin', capturedAt }`, and the settings row surfaces the source and the
+date — the built-in `BUILTIN_PRICES_DATE` (`2026-09-29`), or the sync timestamp. A stale price silently
+stamped as current is exactly the failure this provenance prevents.
+
+### 7.6 Why the default is off
+
+The plugin's privacy claim is that it adds no network traffic of its own, and a balance HUD is not a
+component anyone expects to start talking to an external host merely because it was installed. So the
+shipped state is `off`: nothing is fetched until the user presses **`Sync prices`** or deliberately
+selects an auto-sync interval (`off` / 6 h / 24 h / 3 d / 7 d). When auto-sync is enabled, **24 h is the
+default interval**, because the changelog announces a price change before the page changes — a
+months-scale event — while the 304 path makes a daily poll nearly free. Off by default also keeps the
+offline smoke suite honest: nothing in the test path can quietly start depending on the network.
+
+---
+
+## 8. Testing strategy
 
 `node tools/smoke.mjs` is the workhorse and needs no DSH installation and no network:
 
@@ -467,8 +575,9 @@ keeps working.
   `settle()` that lets `fetch` promises land. Each mount runs several render passes so it observes the
   tree *after* async state commits.
 - Fakes for `fetch` (per-mode host responses), `localStorage` and `document` (visibility plus pointer
-  events). The fetch mock throws on any URL other than the two plugin routes and on any method other than
-  `GET` — a regression guard for the relay contract.
+  events). The fetch mock throws on any URL other than the plugin's own routes and on any method other than
+  `GET` — a regression guard for the relay contract, and for the rule that the client half never reaches a
+  non-loopback host (§7.1).
 - It prints one `✓` line per check (64 of them) and throws on the first failure.
 
 Regression guards worth knowing, because each encodes a deliberate decision:
@@ -492,11 +601,17 @@ Regression guards worth knowing, because each encodes a deliberate decision:
 | Budget: 75 % → `warn`, 90 % → `critical`, ≥ 100 % → `over`, `remaining` clamped at 0, and `worstBudgetLevel` takes the more severe of the session and daily budgets | The thresholds and clamping of §4.3, including the "daily exhausted, session cheap" case |
 | Daily ledger: accumulates confirmed spend, ignores 0 and negative amounts, resets to 0 when the Beijing date changes, and falls back to 0 on corrupt content | The confirmed-spend-only rule and the Beijing day boundary of §4.4 |
 | Peak countdown: entering peak from off-peak, returning to off-peak from peak, across the lunch break, and Friday 18:30 → Monday 09:00 | The overnight and weekend branches of §4.5, which are invisible Monday–Friday |
+| Pricing parser: a Latin-1-decoded (mojibake) copy of the page yields the **same** table as the UTF-8 original | Every judgement must be encoding-independent; a Chinese-label match passes a hand-saved page and fails the real fetch path (§7.2) |
+| Pricing parser: the context-length row (`1M`) and the concurrency row right after the price block do not enter the table, and the block is found by trying contiguous runs of six | The two real noise rows of §7.4; the concurrency row makes the block 7 rows long, so a fixed offset slides onto it |
+| Pricing parser: a window whose peak price is not strictly greater than off-peak is **rejected**, and the caller keeps the last good table instead of a partial one | The semantic self-check of §7.3 — a misaligned window produces plausible numbers, not a visible hole |
+| Sync is opt-in: with default settings the suite observes **no** request to the pricing host, and a sync only runs after the `Sync prices` button or an explicit interval choice | The privacy promise in both READMEs, and the reason the suite can stay offline (§7.6) |
+| Synced-price cache round trip preserves `models`, `capturedAt` and the HTTP validators, and `resolvePrices` reports `source` + `capturedAt` | The 304 path depends on the validators surviving; the row's source/date provenance is §7.5 |
 
 What it does **not** cover, and where to look instead:
 
 - **The Host half.** Nothing in `smoke.mjs` loads `lib/index.js`; the loopback filter, route registration,
-  `normalize()` and `normalizeBonuses()` have no offline test. `tools/verify-install.mjs` only checks that
+  `normalize()` and `normalizeBonuses()` have no offline test — nor do the opt-in price-sync fetch, its
+  `If-None-Match`/`304` path or the model-list route of §7.1. `tools/verify-install.mjs` only checks that
   the Host module imports and exports `apply`/`name`/`inject`, which is not the same thing. Adding a small
   host-route test is the most valuable missing piece.
 - **Real browser, real layout, real Cordis/DSH/platform.** Rectangles, `mouseenter` ordering and CSS

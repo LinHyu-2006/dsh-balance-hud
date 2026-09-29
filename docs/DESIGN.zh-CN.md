@@ -15,8 +15,8 @@
 
 | 半边 | 文件 | 职责 |
 | --- | --- | --- |
-| 浏览器（客户端） | `lib/client.js` | 注册 `shell.overlay` 槽位、渲染 HUD、全部记账 |
-| Host | `lib/index.js` | 注入 `deepseekAccount` + `webServer`，开两条只读回环路由 |
+| 浏览器（客户端） | `lib/client.js` | 注册 `shell.overlay` 槽位、渲染 HUD、价格表解析、全部记账 |
+| Host | `lib/index.js` | 注入 `deepseekAccount` + `webServer`，开只读回环路由（余额、赠金、可选的价格同步、模型列表） |
 
 自然的写法是客户端半边直接调 `ctx.remote.account.getBalance()`。**这条路走不通**，
 而且不是"没找对 API"，是两条硬性约束：
@@ -34,15 +34,20 @@
 ```text
 浏览器 ──fetch──► GET /api/balance-hud/balance    （只读、仅回环）
                   GET /api/balance-hud/bonuses    （只读、仅回环、不回执）
+                  GET /api/balance-hud/…          （价格同步：需主动开启；模型列表：仅回环）
                   │
                   └─► ctx.deepseekAccount.getBalance()
                       ctx.deepseekAccount.getUnnotifiedBonuses()
                       └─► 官方 @deepseek-ai/dsh-deepseek-account-platform
+                      fetch(PRICING_DOC_URL)  ← 仅用户主动开启同步时
+                      └─► 官方价格文档页
 ```
 
-**安全边界**：两条路由都只认回环来源（`127.0.0.1`、`::1`、`::ffff:127.0.0.1`、`127.*`），
+**安全边界**：所有路由都只认回环来源（`127.0.0.1`、`::1`、`::ffff:127.0.0.1`、`127.*`），
 其它一律 `403`；只支持 `GET`；不改任何状态；不带凭据；响应带 `cache-control: no-store`。
-Host 半边**从不需要取 token** —— 它只调 `getBalance` / `getUnnotifiedBonuses`，
+**唯一的对外目的地**是可选的价格同步 —— 只有它会请求非回环主机（`PRICING_DOC_URL`，见 §7）；
+模型列表来自 DSH 自己的 `llm` 服务，同样只需要回环。
+涉及账号数据时，Host 半边**从不需要取 token** —— 它只调 `getBalance` / `getUnnotifiedBonuses`，
 从不调 `resolveToken` 或 `getPlatformSession`，所以凭据始终留在官方包里。
 
 ---
@@ -436,7 +441,96 @@ store 一变就 `bumpEpoch()`。
 
 ---
 
-## 7. 测试策略
+## 7. 价格同步：可选、与编码无关、自证校验
+
+预估用的价格表过去是一个常量，只有改源码才会变。现在它可以**从官方价格页同步**，这条链路上的每个
+决定都由三个约束塑造：插件「不自己联网」的承诺、页面的编码，以及「错价比旧价更糟」这一事实。
+
+### 7.1 抓取为什么放在 Host 半边
+
+`PRICING_DOC_URL` 是 `https://api-docs.deepseek.com/zh-cn/quick_start/pricing`，
+也是插件唯一会访问的外部主机。浏览器半边从不直接访问它：客户端只调两条新的只读回环路由 ——
+一条触发同步、一条列出 DSH 已注册的模型 —— 由 Host 半边执行 `fetch`。
+
+三个理由，按重要性排序：
+
+1. **前后半边的形状本来就是这样。** §1 的中继之所以在 Host 侧，是因为客户端半边够不到账号服务；
+   任何对外请求都受同一个不对称性约束。把唯一的网络目的地留在 `lib/index.js` 里，
+   「这个插件能访问哪里」就只有一页答案，评审时看得完。
+2. **没有 CORS，也没有浏览器策略面。** 从客户端半边发跨源 `fetch` 会依赖文档站的 CORS 头，
+   而且请求跑在用户的浏览器会话里（cookie、origin、referrer）。Host 半边的 Node 侧 `fetch`
+   就是一个普通的服务端请求，这些都不存在。
+3. **模型列表根本不需要网络。** DSH 自己的 `llm` 服务本来就暴露了已注册的模型与 provider，
+   所以「哪些模型有价」是一次纯回环读取。
+
+请求带 `If-None-Match` 和已存的 `ETag`（以及 `Last-Modified`），页面没变就回
+**`304 Not Modified` 且没有响应体** —— 每次轮询只有几百字节。
+
+### 7.2 编码陷阱，以及为什么每个判断都与编码无关
+
+抓取链路可能把 UTF-8 字节按 Latin-1 解开。这时 `元` 会变成两个乱码码点，长度还随解码方式变化，
+页面上所有中文标签（`空闲时段`、`高峰时段`、`百万tokens输入`）都成了乱码。
+**任何依赖这些标签的判断，都能在手工保存的页面上跑通，却在真实抓取链路上失效。**
+
+所以 `parsePricingPage` 里没有任何中文匹配。它只用三个锚点，全部与编码无关：
+
+| 判断 | 锚点 | 为什么换编码也成立 |
+| --- | --- | --- |
+| 有哪些模型、分别是哪一列 | 表头行里的模型 id（`deepseek-…`） | id 是 ASCII，只需要位置 |
+| 这一格是不是价格 | 「以数字开头，后面除了空白与非数字字符什么都没有」 | `元`、乱码、空后缀都能命中；含字母的说明格（如 `百万tokens输入`）会被排除 |
+| 这一行是哪一档 | 区段内的**行序**（每类第一行闲时、第二行峰时） | 官方表格排版固定，不需要查标签 |
+
+脚本、样式和注释块会先被剥掉，因为里面也有数字。
+
+### 7.3 语义自证比「解析完整」更重要
+
+官方规则是「闲时价 = 峰时价的一半」，所以每个模型的每个类别都必须**严格**满足 `peak > off`；
+校验还要求两档都存在、有限且非负。
+
+这比「解析完整」重要得多。漏掉一行的解析会留下一个洞，看得见；**取错六行**的解析一个洞都没有 ——
+它给出的是**挂在错误档位上的、看起来完全合理的数字**，而这些数字会直接进入预估与分摊权重。
+拿官方规则去校验的关系式，正好能抓住这类错误，而形状/数字检查抓不住。
+
+校验一旦不过，整次同步**整体作废**：插件保留上一份好表（内置表，或上次同步成功的表），
+**绝不拿半份结果去算钱**。这也是为什么回落点是 `resolvePrices`，而不是「拿到多少算多少」。
+
+### 7.4 两个噪声行，以及价格区段是怎么定位的
+
+真实页面上，恰好在一个「顺手扫一遍」会捞到的位置，有两行看起来就像价格：
+
+- 表头里的上下文长度行（`上下文长度 | 1M`）；
+- 紧跟在价格区段后面的并发限制行（`并发限制 | 2500 | 500`）。
+
+后者更麻烦：它让价格区段变成**七**行，于是「价格表头后面取连续六行」会滑到它上面。
+所以解析器不信固定偏移：它先按 §7.2 的编码无关判据收集所有候选行，再枚举它们的**连续六行**组合，
+取第一个通过 §7.3 语义校验的组合。混进任一噪声行的组合都会让 `peak > off` 失败，
+于是换下一个起点重试。
+
+### 7.5 缓存键与来源标识
+
+`saveSyncedPrices` / `loadSyncedPrices` 用的 `localStorage` 键是
+`dsh-balance-hud:prices:v1`（`PRICES_CACHE_KEY`），里面存解析出的 `models`，
+**外加 HTTP 校验器与抓取时间戳** —— 校验器正是让下一次轮询变成 304、而不是整页重传的东西。
+读取和其他存储访问一样包在 `try/catch` 里，缓存损坏就退回内置表。
+
+`resolvePrices(synced)` 做合并：同步来的模型**按模型**优先，同步没覆盖到的内置模型保留下来，
+所以官方新增或下架模型都不会把表弄空。它返回
+`{ prices, source: 'synced' | 'builtin', capturedAt }`，设置行把来源和日期显示出来 ——
+内置表的 `BUILTIN_PRICES_DATE`（`2026-09-29`），或同步时间戳。
+把过期价格悄悄标成当前价格，正是这套来源标识要防的事故。
+
+### 7.6 为什么默认是关
+
+插件的隐私承诺是「不自己增加网络流量」，而余额 HUD 也不是那种「装上就会去连外部主机」的组件。
+所以出厂状态是 `off`：用户不按 **`Sync prices`**、也不主动选自动同步间隔
+（`off` / 6 小时 / 24 小时 / 3 天 / 7 天）之前，什么都不会抓。开启自动同步后
+**默认间隔是 24 小时** —— 因为 changelog 会先预告调价、价格页之后才改，这是「几个月一次」的事件，
+而 304 让每天一次的轮询几乎不花成本。默认关还有一个好处：离线冒烟套件里没有任何路径能悄悄开始
+依赖网络。
+
+---
+
+## 8. 测试策略
 
 ```bash
 node tools/smoke.mjs                      # 离线，64 条断言，不需要装 DSH
@@ -455,7 +549,8 @@ node tools/verify-install.mjs             # 校验真实安装
 脏配置收敛 / 落盘往返 / 容器广播与部分合并 / 损坏回落）、预算四档与剩余夹 0、两条预算取最严重、
 每日台账（累加 / 忽略 0 与负数 / 跨天归零 / 损坏回落）、峰谷倒计时（峰时 / 闲时 / 午休 / 跨周末）。
 
-**它不覆盖**：Host 半边（`lib/index.js` 从不加载）、真实浏览器、真实 Cordis 注入、
+**它不覆盖**：Host 半边（`lib/index.js` 从不加载，因此可选的价格同步抓取、
+`If-None-Match`/304 路径与模型列表路由都没有离线测试）、真实浏览器、真实 Cordis 注入、
 真实平台。所以**改了 Host 半边必须手工验证并重启 DSH**。
 
 **作为回归守卫写死的断言**（改坏了会立刻红）：
@@ -481,6 +576,15 @@ node tools/verify-install.mjs             # 校验真实安装
 - **每日台账**：累加确认花费、忽略 0 与负数、北京日期变化时归零、内容损坏回落 0（§4.4）
 - **峰谷倒计时**：峰前、峰后、跨午休，以及周五 18:30 → 周一 09:00（§4.5 的跨夜与跨周末分支 ——
   这里写错的话周一到周五完全看不出来）
+- **价格解析与编码无关**：把页面按 Latin-1 解出的乱码副本喂进去，结果必须与 UTF-8 原文**完全一致**
+  （§7.2 —— 只认中文标签的写法能过手工页，过不了真实抓取链路）
+- **两个噪声行不得进表**：上下文长度行（`1M`）与紧随价格区段的并发限制行都不能被算成价格；
+  价格区段靠「枚举连续六行、取第一个通过校验的组合」定位（§7.4 —— 并发行会把区段撑到 7 行）
+- **峰时价必须严格大于闲时价**，否则整次同步作废、保留上一份好表，**绝不用半解析结果算钱**（§7.3）
+- **同步默认关闭**：默认配置下不得产生任何到价格页的请求；只有按了 `Sync prices` 或主动选了同步
+  间隔才会跑（§7.6，也是两个 README 的隐私承诺）
+- **同步缓存的落盘往返**保留 `models`、`capturedAt` 与 HTTP 校验器，且 `resolvePrices`
+  如实给出 `source` 与 `capturedAt`（§7.5 —— 304 依赖校验器活下来）
 
 > 写这些用例时踩过一个坑：给"B 消费了 5.5 元"的用例传了 **token 上界 = 0**，
 > 于是按判据它必然被判成 `expire`（降幅超过上界），测试反而断言失败。
@@ -493,6 +597,7 @@ node tools/verify-install.mjs             # 校验真实安装
 | 位置 | 内容 |
 | --- | --- |
 | `lib/client.js` → `PRICES` / `isPeakHour` / `costOf` | 价格表与四类计价 |
+| `lib/client.js` → `parsePricingPage` / `resolvePrices` / `loadSyncedPrices` / `saveSyncedPrices` / `BUILTIN_PRICES_DATE` / `PRICES_CACHE_KEY` | 价格同步：编码无关解析、语义校验、来源标识（§7） |
 | `lib/client.js` → `formatMoney` / `formatCostShort` / `formatCost` | 2 位 / 4 位显示与哨兵 |
 | `lib/client.js` → `readBalance` / `readBonuses` | 两条回环路由的客户端封装 |
 | `lib/client.js` → `readStore` / `writeStore` / `classifyRead` / `previousBalanceOf` / `observeRead` / `applyExternalChange` | 记账核心（纯逻辑，好测） |
@@ -500,4 +605,4 @@ node tools/verify-install.mjs             # 校验真实安装
 | `lib/client.js` → `evaluateBudget` / `worstBudgetLevel` / `beijingDateKey` / `loadDaily` / `addDailySpent` / `minutesUntilTierChange` | 预算与峰谷（§4.3–§4.5） |
 | `lib/client.js` → `BalanceHud` / `BalanceHudSettingsRow` | 组件：浮层与设置行（两个独立注册点，共享配置容器） |
 | `lib/client.js` → `exports.__test` | 导出给冒烟测试的纯函数 |
-| `lib/index.js` | Host 半边：两条路由 + 归一化 |
+| `lib/index.js` | Host 半边：只读回环路由 + 归一化（含可选的价格同步抓取，§7） |
