@@ -5,7 +5,7 @@ Thanks for looking at this. Issues and pull requests are welcome.
 ## Before you start
 
 ```bash
-node tools/smoke.mjs                      # offline smoke suite, 71 assertions, no DSH needed
+node tools/smoke.mjs                      # offline smoke suite, 76 assertions, no DSH needed
 node tools/verify-install.mjs --package   # packaging self-check, no DSH needed
 ```
 

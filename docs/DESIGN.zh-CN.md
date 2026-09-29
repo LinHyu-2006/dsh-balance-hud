@@ -542,7 +542,7 @@ changelog 会先预告调价、价格页之后才改，这是「几个月一次�
 ## 8. 测试策略
 
 ```bash
-node tools/smoke.mjs                      # 离线，71 条断言，不需要装 DSH
+node tools/smoke.mjs                      # 离线，76 条断言，不需要装 DSH
 node tools/verify-install.mjs --package   # 打包自检（清单 / patch / 两份入口）
 node tools/verify-install.mjs             # 校验真实安装
 ```

@@ -1319,6 +1319,87 @@ console.log(`✓ 可见性联动：回前台立刻补读（${before} → ${balan
   console.log('✓ 价格同步：默认关闭（零外联），非法间隔收敛为关闭，24 小时为默认档');
 }
 
+// 15) 模型对齐：按会话实际使用的模型计价
+{
+  const { sessionModelOf, sessionModelsUsed, normalizeSettings, defaultSettings, costOf } =
+    normal.plugin.__test;
+
+  // 15a) 三种来源的优先级：requestContext > requestHeader > 最后一条助手消息
+  const withAll = {
+    requestContext: () => ({ provider: 'p', model: 'deepseek-v4-pro' }),
+    requestHeader: () => ({ config: { model: 'deepseek-flash' } }),
+    deriveMessages: () => [{ source: { model: 'deepseek-flash' } }]
+  };
+  if (sessionModelOf(withAll) !== 'deepseek-v4-pro') {
+    throw new Error(`应优先取 requestContext：${sessionModelOf(withAll)}`);
+  }
+  const withoutContext = {
+    requestContext: () => undefined,
+    requestHeader: () => ({ config: { model: 'deepseek-v4-pro' } }),
+    deriveMessages: () => [{ source: { model: 'deepseek-flash' } }]
+  };
+  if (sessionModelOf(withoutContext) !== 'deepseek-v4-pro') {
+    throw new Error(`应回落到 requestHeader：${sessionModelOf(withoutContext)}`);
+  }
+  const onlyMessages = {
+    requestContext: () => undefined,
+    requestHeader: () => undefined,
+    deriveMessages: () => [{ source: { model: 'deepseek-flash' } }, { source: { model: 'deepseek-v4-pro' } }]
+  };
+  if (sessionModelOf(onlyMessages) !== 'deepseek-v4-pro') {
+    throw new Error(`应取最后一条助手消息的模型：${sessionModelOf(onlyMessages)}`);
+  }
+  console.log('✓ 模型对齐：requestContext → requestHeader → 最后一条助手消息，逐级回落');
+
+  // 15b) 接口全挂掉 / 全空 时要返回 undefined（让调用方回落用户设置），不能抛错
+  const hostile = {
+    requestContext: () => { throw new Error('boom'); },
+    requestHeader: () => { throw new Error('boom'); },
+    deriveMessages: () => { throw new Error('boom'); }
+  };
+  if (sessionModelOf(hostile) !== undefined) throw new Error('接口抛错时应返回 undefined');
+  const empty = { requestContext: () => ({ model: '' }), requestHeader: () => undefined, deriveMessages: () => [] };
+  if (sessionModelOf(empty) !== undefined) throw new Error('拿不到模型时应返回 undefined');
+  if (sessionModelOf(undefined) !== undefined) throw new Error('无会话时应返回 undefined');
+  console.log('✓ 模型对齐：接口异常或为空时安全回落（不抛错、不猜）');
+
+  // 15c) 混用多个模型要能被识别出来（用于如实标注"这是估算"）
+  const mixed = {
+    deriveMessages: () => [
+      { source: { model: 'deepseek-flash' } },
+      { source: { model: 'deepseek-v4-pro' } },
+      { source: { model: 'deepseek-flash' } }
+    ]
+  };
+  const used = sessionModelsUsed(mixed);
+  if (used.length !== 2 || used[0] !== 'deepseek-flash' || used[1] !== 'deepseek-v4-pro') {
+    throw new Error(`混用模型识别不对：${JSON.stringify(used)}`);
+  }
+  if (sessionModelsUsed({ deriveMessages: () => [{ role: 'user' }] }).length !== 0) {
+    throw new Error('没有模型痕迹时应返回空数组');
+  }
+  console.log('✓ 模型对齐：识别会话混用过多个模型（用于标注估算而非精确值）');
+
+  // 15d) 对齐真的会改钱：同一份用量按两个模型算出来的价必须不同
+  const usage = { uncachedInputTokens: 1_000_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 };
+  const flash = costOf(usage, 'deepseek-flash', false).total;
+  const pro = costOf(usage, 'deepseek-v4-pro', false).total;
+  if (Math.abs(flash - 1) > 1e-9) throw new Error(`flash 未命中输入应为 1：${flash}`);
+  if (Math.abs(pro - 4.5) > 1e-9) throw new Error(`pro 未命中输入应为 4.5：${pro}`);
+  if (flash === pro) throw new Error('两个模型的价不该相同');
+  console.log(`✓ 模型对齐：同一用量下 flash ¥${flash} ≠ pro ¥${pro}（选错模型确实会算错钱）`);
+
+  // 15e) 默认跟随会话，且该开关必须逐字段收敛
+  if (defaultSettings().modelFollowsSession !== true) throw new Error('默认应跟随会话模型');
+  if (normalizeSettings({ modelFollowsSession: 'yes' }).modelFollowsSession !== true) {
+    throw new Error('非布尔应回落到默认 true');
+  }
+  if (normalizeSettings({ modelFollowsSession: false }).modelFollowsSession !== false) {
+    throw new Error('显式 false 应保留');
+  }
+  console.log('✓ 模型对齐：默认跟随会话，非法值逐字段收敛');
+}
+
 console.log('\n全部冒烟测试通过');
 // 组件里的轮询定时器会吊住事件循环，显式退出。
 process.exit(0);

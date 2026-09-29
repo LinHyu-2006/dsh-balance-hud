@@ -154,7 +154,7 @@ node tools/verify-install.mjs --package
 
 - [ ] `git status` 里没有 `node_modules/`、`.env`、临时文件、编辑器目录
 - [ ] 全仓库搜过一遍密钥（见下）
-- [ ] `node tools/smoke.mjs` 退出码 0（71 条断言）
+- [ ] `node tools/smoke.mjs` 退出码 0（76 条断言）
 - [ ] `node tools/verify-install.mjs --package` 退出码 0
 - [ ] README 顶部的语言切换链接指向真实存在的文件
 - [ ] 仓库里没有绝对路径泄漏用户名
