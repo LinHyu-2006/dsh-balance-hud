@@ -78,10 +78,13 @@ Host 半边**从不需要取 token** —— 它只调 `getBalance` / `getUnnotif
 `observeRead(sessionId, balance, tokenEstimate)` 是唯一入口：读表 → 判定 → 落盘 →
 返回 `{ kind, amount, spent, store }`。两个关键细节：
 
-- **判定用共享余额**：`previousBalance` 优先取 `lastObservedBalance`（可能由另一个会话写入），
-  因为账户余额是账户级的一个数字。取不到才回退到本会话的 `lastBalance` / `baseline`。
-- **充值走 `reanchorAll`**：把所有会话的 `baseline` 与 `lastBalance` 一起抬到当前余额，
-  **`spent` 全部原样保留**，并在 `topups[]` 记一条。
+- **判定用本会话自己的上次读数**：`previousBalanceOf` 首选 `lastRead`（本会话真正观测到的余额）。
+  这是刻意的 —— 外部变动会改写 `baseline` / `lastBalance`，但不会动 `lastRead`，
+  于是别的会话观测到的变动会在本会话下次读数时重新出现，被各自独立判出（§2.4）。
+  只有迁移过来的老数据才回退到 `lastBalance` / `baseline` / 共享的 `lastObservedBalance`。
+- **外部变动走 `applyExternalChange`**：把所有会话的 `baseline` 与 `lastBalance` 一起移到
+  当前余额（**不动 `lastRead`**），**`spent` 全部原样保留**，并在 `topups[]` 里记一条
+  （带 `kind`：`topup` 或 `expire`）。
 
 ### 2.3 为什么最终选了计数器，而不是"锚点相减"
 
@@ -120,7 +123,7 @@ Host 半边**从不需要取 token** —— 它只调 `getBalance` / `getUnnotif
 也不需要恢复判定，代码路径只有一条。这也是用户最初要求的语义：
 **不改变花费，只改变余额。**
 
-### 2.4 充值判定为什么要用 token 估算上界
+### 2.4 外部变动判定为什么要用 token 估算上界（双向）
 
 一开始用的是固定 epsilon（`余额升幅 > 0.01` 就是充值）。这个数没有依据，
 而且两头都错：平台余额偶尔向上抖动 0.01 会误判；"充值和消费同时发生"时
@@ -130,25 +133,51 @@ Host 半边**从不需要取 token** —— 它只调 `getBalance` / `getUnnotif
 
 > 平台扣掉的钱**不可能超过**这段时间消耗的 token 按官方价目表算出来的钱。
 
-因为模型调用是唯一的计费项，所以任何超过 token 估算的余额升幅，**必然**来自外部
-（充值 / 赠金 / 账单修正 / 退款）。这个上界严格成立，而且 token 估算本来就在算（§ 价格表），
-不引入新的不确定性。
+这句话**双向都成立**。上升方向：任何超过 token 估算的升幅**必然**来自外部
+（充值 / 赠金到账 / 账单修正）。下降方向：任何超过 token 估算的降幅**也必然**来自外部
+（赠金过期回收 / 退款 / 账单修正）—— 因为真实消费不可能超过 token 所值的钱。
+
+```
+升幅 > 上界 + 0.02  →  topup   外部加钱
+降幅 > 上界 + 0.02  →  expire  外部减钱
+其余                →  spend / noise
+```
 
 容差只需要覆盖浮点和分位取整噪声，所以 `TOPUP_TOLERANCE = 0.02` 就够了。
+
+**`expire` 这一档是赠金时效性逼出来的。** 赠金有有效期，到期未用完的部分被平台回收，
+表现是余额凭空下降却没有对应消费。早期实现里 `classifyRead` 有一行
+
+```js
+if (delta < 0) return { kind: "spend", amount: -delta };   // ❌ 任何下降都算消费
+```
+
+于是 5 元赠金过期被记成 5 元花费；又因为 `spent` 只增不减，这个错误会留在记录里
+直到 30 天后被淘汰。现在 `topup` 与 `expire` 走**同一条路径**：
+`applyExternalChange` 只移动账户级字段，`spent` 原样保留，并在 `topups[]` 里记下 `kind`。
+
+**一个关键的不变量**：`applyExternalChange` 移动所有会话的 `baseline` / `lastBalance`，
+但**绝不动 `lastRead`**。理由见 `previousBalanceOf`：`lastRead` 是会话私有的
+"上次真正观测到的余额"，不动它，每个会话就会**自愈** —— 还没观测到这次变动的会话
+下次读数时仍能看到完整落差，于是自己也能判出这是外部变动，而不会把差额摊到消费上。
 
 ### 2.5 三层保障
 
 | 层 | 实现 | 权威度 |
 | --- | --- | --- |
-| 1 | token 上界判据（纯客户端） | 权威 |
-| 2 | 官方赠金印证 `GET /api/balance-hud/bonuses` | 印证 |
+| 1 | token 上界判据（纯客户端、双向） | 权威 |
+| 2 | 官方赠金印证 `GET /api/balance-hud/bonuses` | 印证（只覆盖"发放"） |
 | 3 | 手动兜底按钮 | 纠正 |
 
 第 2 层有个**刻意的设计决定**：`getUnnotifiedBonuses()` 拿到的是"未回执"的赠金，
 官方还提供了 `ackBonusNotified()` 来回执。插件**只读不回执** ——
 回执会把赠金标成"已展示"，那会**抢掉 DSH 自己的赠金通知**。
 代价是这份数据会一直可读，所以客户端按 `orderId` 去重。
-如果这条路由不通，充值**仍然会被识别**（第 1 层是权威），这一层只是加分。
+如果这条路由不通，变动**仍然会被识别**（第 1 层是权威），这一层只是加分。
+
+还要注意第 2 层的**能力边界**：它只能印证"赠金发放"，**官方没有"过期"的推送**。
+所以减钱那个方向完全依赖第 1 层。官方在赠金条目里给了 `expiresAt`，
+插件把它透出来显示"最早到期"，但**不参与记账判定** —— 判定唯一的依据是 token 上界。
 
 第 3 层不只是视觉反馈：它先做重锚（本地、瞬时），**再**查一次赠金路由（网络），
 `查询中…` 这个状态就是由那次真实网络请求支撑的。
@@ -184,10 +213,20 @@ Host 半边**从不需要取 token** —— 它只调 `getBalance` / `getUnnotif
 ```json
 {
   "sessions": {
-    "<会话id>": { "baseline": 43.42, "lastBalance": 43.12, "spent": 0.3, "ts": 0 }
+    "<会话id>": { "baseline": 43.42, "lastBalance": 43.12, "lastRead": 43.12, "spent": 0.3, "ts": 0 }
   }
 }
 ```
+
+字段语义（三者的区别容易被混，务必分清）：
+
+| 字段 | 含义 | 谁在改 |
+| --- | --- | --- |
+| `baseline` | 本会话窗口**起点**的账户余额 | 外部变动时被重锚 |
+| `lastBalance` | 最近一次**外部变动后**的账户余额（账户级） | 外部变动时被重写 |
+| `lastRead` | 本会话**真正观测到**的余额 | **只有本会话自己的读数会改它** |
+
+`lastRead` 是唯一不该被外部变动触碰的字段 —— 这正是每个会话能"自愈"的原因（§2.4）。
 
 > 目前 `writeStore()` **只持久化 `sessions`**。`topups[]` 与 `lastObservedBalance`
 > 只活在内存里（页面存活期间）。这是已知的取舍，不是 bug —— 它们不参与跨会话的正确性。
@@ -251,12 +290,29 @@ store 一变就 `bumpEpoch()`。
 "其实已经离开卡片"的空白处不消失。判定必须挂在卡片和面板**各自**身上，
 并配一个 140ms 的待关闭定时器，让指针穿过 8px 间隔时面板的 enter 取消卡片的 leave。
 
+**5.8 持久化层曾经是"有损"的 —— 两个写入方都漏字段。**
+第一处：`createTracker` 把磁盘字段 `lastBalance` 改名成 `last`，并且只映射了当时存在的几个字段。
+后来给记录加了 `lastRead`，`readStore()` 能读到、但 `observeRead` 拿到的对象里没有它，
+于是 `previousBalanceOf` 退化成用**事件余额**当上次读数，把整段真实消费判成外部变动**吞掉**。
+第二处：`persistTracker` 用固定字段列表**重建**整条记录，于是 `checkoutSession`
+（每次切换会话都会走）会把 `lastRead` 抹掉，还会把 `lastBalance` 写成 `undefined`
+—— 而 `undefined` 在 `JSON.stringify` 时会**直接消失**，等于静默删字段。
+教训：持久化记录在"读—改—写"之间必须**无损**；写入方要以磁盘上已有的那条为基底，
+只覆盖自己确实持有的字段。现在两个写入方都遵守这条，并各有一个回归断言钉着。
+
+**5.9 一个字段塞两种含义，必然出错。**
+修 5.8 的过程中我加过一个"重锚桥"字段 `reanchor`，想让它在外部变动后
+充当"上次读数"。问题是它同时被当成"变动前的余额"和"上次读数"用，
+于是每次修一个方向就从另一个方向漏水，来回改了四五轮。
+最后把它整个删掉，只留 `lastRead` 一个字段承载一种含义，代码立刻变简单且正确。
+**当某个字段需要在一段注释里解释两种用途时，就该拆成两个字段。**
+
 ---
 
 ## 6. 测试策略
 
 ```bash
-node tools/smoke.mjs                      # 离线，47 条断言，不需要装 DSH
+node tools/smoke.mjs                      # 离线，53 条断言，不需要装 DSH
 node tools/verify-install.mjs --package   # 打包自检（清单 / patch / 两份入口）
 node tools/verify-install.mjs             # 校验真实安装
 ```
@@ -268,7 +324,7 @@ node tools/verify-install.mjs             # 校验真实安装
 
 **它覆盖**：模块/槽位注册形状、卡片两列网格、悬停与折叠交互（含跨间隔、左侧滑出）、
 余额三态与全部路由失败模式、四类计价与峰谷、显示精度与 `<¥0.01` 哨兵、
-充值判据与三层保障、持久化与 v1→v4 迁移链、可见性补读。
+充值**与过期**两类外部变动判据、持久化与 v1→v4 迁移链、可见性补读。
 
 **它不覆盖**：Host 半边（`lib/index.js` 从不加载）、真实浏览器、真实 Cordis 注入、
 真实平台。所以**改了 Host 半边必须手工验证并重启 DSH**。
@@ -278,9 +334,18 @@ node tools/verify-install.mjs             # 校验真实安装
 - 不得出现 `title` 属性
 - 卡片是两列网格，且**只剩 2 行**（`账户余额` / `本会话预估`）
 - 充值**不得**改变 `spent`
+- **赠金过期（外部减钱）不得改变 `spent`**，且锚点要同步下移
+- 降幅在 token 上界以内**仍须算消费**（不能把正常消费误判成回收）
+- 过期要把所有会话的锚点一起下移，而各会话**仍按自己的上次读数**继续累计
 - 两个会话的分摊值**必须不同**（防锚点串号）
+- **切换会话不得损坏记录**：`checkoutSession` 之后 `baseline` / `lastRead` / `lastBalance` /
+  `spent` 必须一字不变，且持久化内容里不得出现 `undefined`
 - `tokensOf` 与 `costOf` 口径一致，且峰时价 > 闲时价
 - `查询中…` 状态出现且按钮 disabled，并且确实调用了赠金路由
+
+> 写这些用例时踩过一个坑：给"B 消费了 5.5 元"的用例传了 **token 上界 = 0**，
+> 于是按判据它必然被判成 `expire`（降幅超过上界），测试反而断言失败。
+> 上界必须取**现实值**（≥ 该期间的真实消费额），否则用例本身就在构造不可能的场景。
 
 ---
 
@@ -291,7 +356,7 @@ node tools/verify-install.mjs             # 校验真实安装
 | `lib/client.js` → `PRICES` / `isPeakHour` / `costOf` | 价格表与四类计价 |
 | `lib/client.js` → `formatMoney` / `formatCostShort` / `formatCost` | 2 位 / 4 位显示与哨兵 |
 | `lib/client.js` → `readBalance` / `readBonuses` | 两条回环路由的客户端封装 |
-| `lib/client.js` → `readStore` / `writeStore` / `classifyRead` / `observeRead` / `reanchorAll` | 记账核心（纯逻辑，好测） |
+| `lib/client.js` → `readStore` / `writeStore` / `classifyRead` / `previousBalanceOf` / `observeRead` / `applyExternalChange` | 记账核心（纯逻辑，好测） |
 | `lib/client.js` → `BalanceHud` | 组件：布局、交互、轮询 |
 | `lib/client.js` → `exports.__test` | 导出给冒烟测试的纯函数 |
 | `lib/index.js` | Host 半边：两条路由 + 归一化 |

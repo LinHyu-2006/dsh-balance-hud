@@ -10,17 +10,19 @@ DeepSeek **account balance** and the **cost of the current session**.
 - **Account balance** — recharge balance + bonus balance, read through the same service the
   *Settings → Account & balance* page uses (`ctx.deepseekAccount.getBalance()`).
 - **Two cost figures** — a token-based *estimate* from the official price table, and an *actual*
-  figure accumulated from real balance decreases.
-- **Top-up aware** — a top-up raises the balance but never stops the spending counter.
+  figure accumulated from real balance decreases (external reductions excluded).
+- **External balance changes, both ways** — a top-up raises the balance, and a lapsed bonus grant is
+  reclaimed by the platform; money moving in or out externally never touches the spending counter.
 - **Per session** — the tracker is keyed by session id; refreshing the page or switching sessions
-  never clobbers another session's record.
+  never damages or clobbers another session's record, because the read → modify → write round trip
+  is lossless.
 - **No credentials, no outbound network of its own** — the plugin never touches your API key.
 - **Two halves, one relay** — a browser half renders the HUD; a Host half exposes two read-only
   loopback HTTP routes so the browser can read the balance.
 
 ```bash
 node tools/install.mjs    # install into ~/.dsh/profiles/desktop, then restart DSH
-node tools/smoke.mjs      # offline smoke suite (47 assertions), no DSH install needed
+node tools/smoke.mjs      # offline smoke suite (53 assertions), no DSH install needed
 ```
 
 ## The HUD
@@ -74,44 +76,76 @@ panel, so real spending is never rounded down to a flat zero.
 | Figure | How it is computed | Nature |
 | --- | --- | --- |
 | **Estimate** | Session `tokenUsage` projection × the official price table | Exactly computable, but covers model tokens only |
-| **Actual** | Accumulated sum of observed **balance decreases**, stored per session in `localStorage` | What the platform really charged, but settled with a delay |
+| **Actual** | Accumulated sum of observed **balance decreases classified as spending** (drops beyond the token bound are external reductions and are excluded), stored per session in `localStorage` | What the platform really charged, but settled with a delay |
 
 The estimate splits usage into four token classes — uncached input, cache hit, cache write and
 output — and prices each class with peak/off-peak rates. **Cache writes are charged at the
 cache-miss rate**, matching how the platform bills them. The actual figure is a **counter, not a
-subtraction**: every observed balance drop is added to the current session's counter, so a top-up
-cannot disturb it.
+subtraction**: every observed balance drop is added to the current session's counter, so neither a
+top-up nor an externally reclaimed bonus can disturb it.
 
-## Top-up detection
+## Top-ups and other external balance changes
 
-**Principle: a top-up changes the balance but must not change the spending counter.**
+**Principle: money entering or leaving the balance from outside changes the balance but must not
+change the spending counter.**
 
-The classifier uses a **token-estimate upper bound** instead of an arbitrary epsilon:
+The classifier applies the **token-estimate upper bound** in *both* directions rather than an
+arbitrary epsilon:
 
 ```text
-balance rise > total token estimate + 0.02  →  the difference can only be externally added money
-                                               (top-up, bonus grant, billing correction)
+balance rise > total token estimate + 0.02  →  externally added money      (topup)
+                                               top-up, bonus grant, billing correction
+balance drop > total token estimate + 0.02  →  externally removed money    (expire)
+                                               bonus expiry, refund reversal, billing correction
 everything else                             →  ordinary spending, accumulate as usual
 ```
 
-The platform can never have charged more than the tokens consumed are worth, so any bigger rise
-must have come from outside. That survives a "top-up and spending at the same time" event and
-cannot be triggered by normal spending noise. On detection the plugin only **re-anchors** the
-baseline and leaves the counter untouched, so spending keeps accumulating — there is no "paused"
-state. Because the balance is account-wide, a top-up re-anchors **every** session's baseline.
+The platform can never have charged more than the tokens consumed are worth, so a bigger rise must
+have come from outside. Symmetrically, it cannot charge for tokens that were not consumed: a drop
+larger than the worth of every token spent in the window cannot have come from consumption either.
+The *same* bound therefore catches a bonus expiry as well, survives a "top-up and spending at the
+same time" event, and cannot be triggered by normal spending noise.
+
+**Why the reduction direction exists: bonus expiry.** A bonus grant that lapses is reclaimed by the
+platform, so the balance drops with no token consumption behind it. The previous implementation
+classified *every* decrease as spending (`if (delta < 0) return { kind: 'spend', amount: -delta }`),
+so a ¥5 bonus expiring was recorded as ¥5 of session spending — and because the counter only grows,
+the error stayed in the record until the entry was pruned.
+
+Both directions take the **same code path** (`applyExternalChange`): only the account-level bookmark
+moves — every session's `baseline` and `lastBalance` — while `spent` is left untouched, and the
+event is appended to the `topups[]` history carrying its `kind` (`'topup'` or `'expire'`). Because
+the balance is account-wide, one event re-anchors **every** session. The function deliberately never
+touches `lastRead` — "the balance this session actually observed last" is session-private — so a
+session that has not yet observed the change still sees the full drop on its next read and
+classifies it as an external change instead of charging it to its own spending. Each session
+self-heals, and the event is not double-counted because the session that triggered it already
+advanced its own `lastRead`.
 
 Three layers, in order of authority:
 
-1. **The token-bound rule** — pure client side, always active, the authority.
+1. **The token-bound rule** — pure client side, always active: the authority in both directions.
 2. **Official bonus-grant confirmation** — `GET /api/balance-hud/bonuses` reads
    `ctx.deepseekAccount.getUnnotifiedBonuses()`. It is **read-only and deliberately does not call
    `ackBonusNotified`**, so it never consumes DSH's own bonus notifications; the data stays
-   readable and the client de-duplicates by `orderId`. If the route is unreachable the top-up is
-   still detected — this layer is only corroboration.
+   readable and the client de-duplicates by `orderId`. This layer corroborates **grants** only:
+   there is **no official "expired" feed**, which is exactly why the token bound has to be the
+   authority in the reduction direction. If the route is unreachable a top-up is still detected —
+   this layer is only corroboration. `normalizeBonuses` also passes `expiresAt` through (it is
+   **not** what the accounting decision uses) so the notice can name the earliest lapse date.
 3. **A manual fallback** — the *I just topped up* button takes the same re-anchor path and shows a
    "querying…" state while it re-anchors and queries the bonuses route.
 
-A detected top-up shows a one-line notice in the panel for about 12 seconds.
+**Notices.** An external change in either direction shows a one-line notice in the panel for about
+12 seconds:
+
+- a top-up: `已识别充值 ¥50.00，花费继续累计（官方赠金 ¥5.00 印证），最早到期 2025-12-31。` —
+  "recognised a ¥50.00 top-up; spending keeps accumulating (corroborated by an official ¥5.00
+  bonus); earliest expiry 2025-12-31". The earliest bonus `expiresAt` is appended only when the
+  bonuses route confirms a grant.
+- an external reduction: `检测到 ¥5.00 非消费性扣减（赠金过期回收等），未计入花费。` — "detected a
+  ¥5.00 non-consumption deduction (e.g. a bonus expiry being reclaimed); not counted as spending".
+  It is stated explicitly because the money left the balance without appearing in any counter.
 
 ## Parallel sessions and apportionment
 
@@ -136,20 +170,23 @@ the weight was.
 Records live in `localStorage` under `dsh-balance-hud:tracker:v4`, keyed by session id:
 
 ```json
-{ "sessions": { "<session id>": { "baseline": 43.42, "lastBalance": 43.12, "spent": 0.3, "ts": 0 } } }
+{ "sessions": { "<session id>": { "baseline": 43.42, "lastBalance": 43.12, "lastRead": 43.12, "spent": 0.3, "ts": 0 } } }
 ```
 
 | Situation | Behaviour |
 | --- | --- |
 | Page refresh / remount | Read back from `localStorage`, counter keeps accumulating |
-| Switching sessions | Each session has its own record; nothing is overwritten or reset |
-| Top-up detected | Only the baseline moves; `spent` is untouched |
+| Switching sessions | Each session has its own record; `checkoutSession` merges into it rather than rebuilding it, so `baseline`, `lastRead`, `lastBalance` and `spent` survive the switch |
+| External change detected (top-up **or** reclaimed bonus) | Only the baseline moves; `spent` is untouched |
 | Older than 30 days, or more than 30 sessions | Pruned on write; the 30 most recent records are kept |
 | `localStorage` unavailable | Degrades to memory-only; the HUD still works |
 
 The in-memory store also carries a `topups[]` history and a `lastObservedBalance` while the page
-lives; the current writer persists **only** `sessions`. Old data is migrated automatically — `v3`
-was `{ sessions: { … } }`, `v2` a flat `{ [sessionId]: { … } }` dictionary, `v1` a single
+lives; the current writer persists **only** `sessions`. Within a record, `lastRead` is the
+session-private "balance this session actually observed last" and is the preferred comparison point
+on the next read; `lastBalance`, `baseline` and the shared `lastObservedBalance` are only fallbacks
+for records migrated from older versions that predate `lastRead`. Old data is migrated automatically
+— `v3` was `{ sessions: { … } }`, `v2` a flat `{ [sessionId]: { … } }` dictionary, `v1` a single
 `{ sessionId, … }` record — and the legacy key is removed afterwards.
 
 The balance is polled every **60 seconds** (every 5 minutes while the page is hidden), refetched
@@ -237,10 +274,13 @@ node tools/verify-install.mjs             # verify a real installation
 
 `tools/smoke.mjs` evaluates the real `lib/client.js` against a fake React runtime, fake host
 responses, a fake `localStorage` and a fake `document`, then drives the component through its hook
-cycle. It prints one `✓` line per check (47 in total) and exits non-zero on the first failure,
+cycle. It prints one `✓` line per check (53 in total) and exits non-zero on the first failure,
 covering module/slot registration, the card layout, hover and fold interaction, the balance
-protocol and every route failure mode, pricing arithmetic, display precision, the top-up classifier,
-persistence and the migration chain, and visibility-driven refetch.
+protocol and every route failure mode, pricing arithmetic, display precision, the external-change
+classifier (top-ups **and** bonus expiry), persistence and the migration chain, and
+visibility-driven refetch. One persistence guard is the lossless round trip: switching sessions
+through `checkoutSession` must leave `baseline` / `lastRead` / `lastBalance` / `spent` untouched, and
+the persisted blob must contain no `undefined` field.
 
 It does **not** cover the Host half (`lib/index.js` is never loaded), a real browser, real Cordis
 injection, or the real platform. `lib/client.js` is a hand-written CJS-style bundle in the official
@@ -276,6 +316,14 @@ injection, or the real platform. `lib/client.js` is a hand-written CJS-style bun
   old value while the estimate has already moved; the two converge over tens of seconds.
 - **The first baseline is captured slightly after the session starts**, so earlier spending is
   covered by the token estimate instead.
+- **A partial bonus expiry can still be misread as spending.** The token estimate is an upper bound,
+  so if the reclaimed amount happens to fall within the estimate for that window the drop looks like
+  ordinary spending. Eliminating that needs per-wallet expiry breakdowns, but `getBalance()` returns
+  `AccountWallet` as `{ currency, balance }` only — **no expiry data** — so the error is bounded by
+  the token estimate rather than removed. In the other direction, if the token estimate is
+  unavailable and treated as `0`, the bound is tight and real spending in that interval could be
+  misread as an external reduction; in practice the estimate is available because the usage
+  projection is polled every 5 seconds.
 - **The account-level figure is a reference only**, not a per-session number.
 - **Not logged in** is a normal state: the card says so and the HUD recovers on the next poll after
   you sign in.

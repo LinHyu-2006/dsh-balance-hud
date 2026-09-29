@@ -5,7 +5,7 @@ Thanks for looking at this. Issues and pull requests are welcome.
 ## Before you start
 
 ```bash
-node tools/smoke.mjs                      # offline smoke suite, 47 assertions, no DSH needed
+node tools/smoke.mjs                      # offline smoke suite, 53 assertions, no DSH needed
 node tools/verify-install.mjs --package   # packaging self-check, no DSH needed
 ```
 
@@ -20,13 +20,27 @@ suite agree with the new behaviour deliberately, or the suite will tell you what
 2. **Never add a `title` attribute to the HUD.** A native browser tooltip appears as an opaque black
    box about a second after hover and covers the panel. Put the summary in `aria-label` instead. The
    smoke suite asserts this.
-3. **Keep one copy of every formula.** Apportionment and cost arithmetic live in the render path
+3. **Separate spending from external balance changes — in both directions.** The token estimate is the
+   only authority for that judgement. Money can enter the balance from outside (top-up, bonus grant) and
+   it can leave from outside (bonus expiry being reclaimed, refund reversal, billing correction); neither
+   is spending. Never classify a raw balance delta as spending without the token bound in
+   `classifyRead`. A bare `delta < 0 → spend` rule is exactly the bug that recorded a reclaimed ¥5 bonus
+   as ¥5 of session spending — permanently, because the counter only grows.
+4. **Persistence must be lossless.** Any field added to a per-session record has to survive the
+   `readStore` → modify → `writeStore` round trip. `createTracker` must not map a subset of fields (it
+   spreads the persisted record and only fills defaults); `persistTracker` must merge into the record
+   already on disk and only overwrite a field the caller actually holds, so it never writes an
+   `undefined` value that `JSON.stringify` would silently delete; and neither may any other writer. A
+   field dropped here is silently replaced by a fallback on the next read: when `lastRead` was lost this
+   way, `previousBalanceOf` fell back to an event balance and swallowed real spending. Both writers are
+   lossless today and the smoke suite pins that; keep it that way.
+5. **Keep one copy of every formula.** Apportionment and cost arithmetic live in the render path
    only. A previous version also exposed an injected helper that duplicated the apportionment maths;
    the two drifted, and it was deleted. If you need a value in two places, extract a function and
    call it from both.
-4. **Write comments that explain *why*, not *what*.** The non-obvious parts of this plugin are all
+6. **Write comments that explain *why*, not *what*.** The non-obvious parts of this plugin are all
    "we tried the obvious thing and it was wrong"; record that, or the next person will re-try it.
-5. **Line endings are LF** and are enforced by `.gitattributes`. Don't fight it.
+7. **Line endings are LF** and are enforced by `.gitattributes`. Don't fight it.
 
 ## Testing notes
 

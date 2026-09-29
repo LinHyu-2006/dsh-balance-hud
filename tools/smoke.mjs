@@ -827,10 +827,8 @@ expectIncludes('无用量会话', textOf(blank.tree), ['余额', '¥43.42', '本
 const fallback = await mount({ usage: USAGE, withSessionsShare: false });
 expectIncludes('无框架 share 的回落路径', textOf(fallback.tree), ['余额', '¥43.42']);
 
-// 8) 账户级基线（v3）：每条锚点都是"该会话首见时的账户余额"，账户级 = Σ锚点 − 当前余额
-// 8a) 首次读数定锚；消费累计；跨"刷新"存活
-// 8) 基线表（v4）：按会话存锚点 + **累计花费计数**，充值只抬锚点不改计数
-//    · 跨刷新存活、切走切回不清零
+// 8) 基线表（v4）：按会话存锚点 + **累计花费计数**，外部变动只移锚点不改计数
+//    · 跨刷新存活、切走切回不清零、**切换会话不损坏记录**
 //    · v3 / v2 / v1 老数据自动迁移
 //    · 过期与超量淘汰、无 localStorage 降级
 const { readStore, loadTracker, createTracker, checkoutSession, observeRead, applyExternalChange, accountLevelDelta, sessionSpentOf } = normal.plugin.__test;
@@ -840,6 +838,38 @@ const sessionA = SESSION_ACTIVE;
 const sessionB = SESSION_IDLE;
 /** 取当前基线表。 */
 const store = () => readStore();
+
+// 8-0) **持久化必须无损**：每次切换会话都会走 checkoutSession，
+//      它绝不能抹掉 lastRead（抹掉的话，下次读数退化成用锚点当"上次读数"，
+//      真实消费会被整段吞掉）。这是"有损重建记录"那个 bug 的回归用例。
+{
+  storage.clear();
+  observeRead(sessionA, 43.42, 0);
+  observeRead(sessionA, 43.12, 0.3);
+  const before = store().sessions[sessionA];
+  if (typeof before.lastRead !== 'number') throw new Error(`读后应写入 lastRead：${JSON.stringify(before)}`);
+
+  // 模拟"切走再切回"：checkoutSession 会被调用
+  checkoutSession(sessionA, 43.12);
+  const after = store().sessions[sessionA];
+  for (const key of ['baseline', 'lastRead', 'lastBalance', 'spent']) {
+    if (after[key] !== before[key]) {
+      throw new Error(`checkoutSession 破坏了 ${key}：${before[key]} → ${after[key]}`);
+    }
+  }
+  // 再切一次（余额未知的情况）
+  checkoutSession(sessionA, null);
+  const after2 = store().sessions[sessionA];
+  if (after2.lastRead !== before.lastRead || after2.lastBalance !== before.lastBalance) {
+    throw new Error(`重复 checkoutSession 破坏了记录：${JSON.stringify(after2)}`);
+  }
+  console.log('✓ checkoutSession 无损：lastRead / lastBalance / spent 都不被抹掉');
+
+  // 记录里不应出现值为 undefined 的字段（JSON 序列化会把它悄悄删掉）
+  const raw = storage.getItem(KEY);
+  if (raw.includes('undefined')) throw new Error(`持久化内容里出现了 undefined：${raw}`);
+  console.log('✓ 持久化内容不含 undefined 字段');
+}
 
 // 8-0) **赠金时效性**：过期回收不可计入花费
 //      赠金到期会被平台收回，表现为余额凭空下降却没有对应消费。

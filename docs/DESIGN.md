@@ -56,13 +56,16 @@ Design rules that follow:
 
 ### 2.1 The quantities
 
-Each session's record is `{ baseline, lastBalance, spent, ts }`:
+Each session's record is `{ baseline, lastBalance, lastRead, spent, ts }`:
 
 - `baseline` — the account balance at the moment this session was first anchored. A **bookmark**, not a
-  spending base.
-- `spent` — the session's accumulated counter of observed **balance decreases**; monotonically
-  non-decreasing.
-- `lastBalance` / `ts` — bookkeeping for the previous observation and for pruning.
+  spending base; an external balance change moves it.
+- `spent` — the session's accumulated counter of observed **balance decreases classified as spending**;
+  monotonically non-decreasing.
+- `lastRead` — the balance **this session** actually observed last, and the only preferred comparison
+  point for its next read. Session-private: an external change never writes it (see §2.2).
+- `lastBalance` / `ts` — the account-level balance after the last event, and pruning bookkeeping. Both
+  are fallbacks for reads that predate `lastRead`.
 
 The account balance is shared by all sessions; the counters are per session. The account-level figure is
 just the sum of every counter (`accountLevelDelta`) and exists only as a panel reference.
@@ -70,17 +73,23 @@ just the sum of every counter (`accountLevelDelta`) and exists only as a panel r
 ### 2.2 Reading a balance: `observeRead`
 
 ```text
-previous = store.lastObservedBalance ?? entry.lastBalance ?? entry.baseline ?? balance
-verdict  = classifyRead(previous, balance, tokenEstimate)
+previous = previousBalanceOf(entry, store)   // entry.lastRead → entry.lastBalance → entry.baseline
+                                             // → store.lastObservedBalance
+verdict  = classifyRead(previous ?? balance, balance, tokenEstimate)
 
-spend → entry.spent += amount
-topup → reanchorAll(balance, ...)     // baselines move, spent does not
-else  → bookkeeping only
+spend  → entry.spent += amount
+topup  → applyExternalChange(balance, amount, sessionId, 'topup')
+expire → applyExternalChange(balance, amount, sessionId, 'expire')   // identical path
+else   → bookkeeping only
 ```
 
 First sight of a session creates the entry and counts nothing. `previous` deliberately prefers
-`store.lastObservedBalance`: the balance is account-wide, so consecutive reads may come from different
-sessions and must still be compared against the last value *anyone* saw.
+`entry.lastRead` — the balance **this session** observed last — rather than a store-wide value: the
+balance is account-wide, so consecutive reads may come from different sessions, but an external change
+moves only the account-level fields (`baseline`, `lastBalance`) and deliberately never `lastRead`. Every
+session therefore still sees the full drop/rise and classifies the event itself, instead of charging it
+to its own spending. The remaining fallbacks exist only for records migrated from a version that predates
+`lastRead`.
 
 ### 2.3 Why the counter replaced anchor subtraction
 
@@ -101,15 +110,15 @@ The first design was `spend = anchor − current balance`. It works for one sess
 
 The v4 model discards anchor subtraction entirely: spending is a counter fed by observed decreases, and
 anchors survive only as the reference point used to classify a read. Three properties follow at once —
-top-ups cannot pause the counter, per-session attribution falls out naturally, and the counter never needs
-to know which session "caused" a decrease.
+an external change in either direction cannot pause the counter, per-session attribution falls out
+naturally, and the counter never needs to know which session "caused" a decrease.
 
-> **Stale comment warning.** The doc comment on `readStore()` in `lib/client.js` still describes
-> `account spend = Σ(baselines) − current balance` as if it were current, *and* claims that formula is
-> accurate. It is neither current nor correct — a leftover from the anchor era. Treat the code as
-> authoritative, and fix the comment when you touch that function.
+> **Stale comment warning.** The doc comment on `readStore()` in `lib/client.js` still lists the record
+> shape as `{ baseline, lastBalance, spent, ts }`, omitting `lastRead`. (It no longer repeats the
+> anchor-era `account spend = Σ(baselines) − current balance` claim — that was fixed.) Trust the code,
+> and update the comment when you extend the record.
 
-### 2.4 Top-up classification is a pure function
+### 2.4 External-change classification is a pure function
 
 ```js
 classifyRead(previousBalance, balance, tokenEstimate) → { kind, amount }
@@ -118,33 +127,46 @@ classifyRead(previousBalance, balance, tokenEstimate) → { kind, amount }
 | Condition | Verdict |
 | --- | --- |
 | `previousBalance` is not a number | `flat` |
-| `|balance − previous| <= 0.0001` | `noise` |
-| `balance < previous` | `spend`, amount = the decrease |
+| `abs(balance − previous) <= 0.0001` | `noise` |
 | `balance − previous > tokenEstimate + 0.02` | `topup`, amount = the increase |
-| otherwise | `noise` |
+| increase within the bound | `noise` |
+| `previous − balance > tokenEstimate + 0.02` | `expire`, amount = the decrease |
+| decrease within the bound | `spend`, amount = the decrease |
 
 Keep it pure: it is exported through `__test`, the smoke suite asserts on it directly, and `observeRead`
 is its only production caller. The idea behind the bound is that **the platform can never have charged
-more than the consumed tokens are worth**. If the balance rises by more than the worth of every token
-spent since the last read, the surplus cannot have come from consumption — only from money added
-externally (top-up, bonus grant, billing correction). The threshold therefore scales with usage instead
-of being a hand-picked epsilon, and it cannot be fooled by "top-up and spend in the same window". The
-`+0.02` tolerance (`TOPUP_TOLERANCE`) only absorbs floating-point and rounding noise.
+more than the consumed tokens are worth** — and the rule is applied in **both** directions, because the
+symmetric statement also holds: the platform cannot have charged for tokens that were not consumed, so a
+drop larger than the worth of every token spent in the window cannot have come from consumption either.
+The threshold therefore scales with usage instead of being a hand-picked epsilon, and it cannot be fooled
+by "top-up and spend in the same window". The `+0.02` tolerance (`TOPUP_TOLERANCE`) only absorbs
+floating-point and rounding noise.
 
-`reanchorAll(balance, amount, sessionId)` then sets **every** session's `baseline` and `lastBalance` to the
-new balance, leaves every `spent` untouched, and pushes the event onto the in-memory `topups` list (capped
-at 10). Re-anchoring all sessions is mandatory: the balance is account-wide, so a session left behind
-would count the top-up as spending on its next read.
+**The reduction direction is what makes bonus expiry survivable.** A grant that lapses is reclaimed by
+the platform and the balance drops with no token consumption behind it. The pre-fix classifier returned
+`spend` for *every* negative delta, so a ¥5 expiry was added to the session counter — and since the
+counter only grows, the error stayed there until the entry was pruned.
+
+`applyExternalChange(balance, amount, sessionId, kind)` then sets **every** session's `baseline` and
+`lastBalance` to the new balance, leaves every `spent` untouched, deliberately leaves every `lastRead`
+alone (§2.2), and pushes `{ at, amount, sessionId, kind }` onto the in-memory `topups` list (capped at
+10). Re-anchoring all sessions is mandatory: the balance is account-wide, so a session left behind would
+count the change as spending on its next read. `kind` (`'topup'` or `'expire'`) is the only difference
+between the two directions, and both share this one path.
 
 ### 2.5 The three layers
 
-1. **Token-bound rule** — `classifyRead`, pure client side, always on: the authority.
+1. **Token-bound rule** — `classifyRead`, pure client side, always on: the authority, in both directions.
 2. **Official bonus confirmation** — after a detected top-up the client reads the bonuses route and, if
-   there are grants whose `orderId` it has not seen, reports their sum as corroboration. Failure degrades
-   to an empty list and can never block or veto layer 1.
-3. **Manual fallback** — the panel button calls `markTopUp(total)`, which takes the same `reanchorAll`
-   path (it never fabricates a `spent` change) and then queries the bonuses route, so the "querying…"
-   state reflects real work.
+   there are grants whose `orderId` it has not seen, reports their sum as corroboration. This layer only
+   ever corroborates **grants**: the platform exposes no "expired" feed (the route returns pending grants,
+   not lapses), which is exactly why the token bound has to be the authority in the reduction direction.
+   Failure degrades to an empty list and can never block or veto layer 1. `normalizeBonuses` also passes
+   `expiresAt` through so the notice can name the earliest lapse date; that field never feeds the
+   accounting decision.
+3. **Manual fallback** — the panel button calls `markTopUp(total)`, which takes the same
+   `applyExternalChange(…, 'topup')` path (it never fabricates a `spent` change) and then queries the
+   bonuses route, so the "querying…" state reflects real work.
 
 Only layers that re-anchor may change the baseline; none of them may touch `spent`.
 
@@ -194,7 +216,7 @@ Key: `dsh-balance-hud:tracker:v4`. Shape written by `writeStore`:
 ```json
 {
   "sessions": {
-    "<session id>": { "baseline": 43.42, "lastBalance": 43.12, "spent": 0.3, "ts": 1780000000000 }
+    "<session id>": { "baseline": 43.42, "lastBalance": 43.12, "lastRead": 43.12, "spent": 0.3, "ts": 1780000000000 }
   }
 }
 ```
@@ -202,6 +224,14 @@ Key: `dsh-balance-hud:tracker:v4`. Shape written by `writeStore`:
 `writeStore` currently persists **only** `sessions`. The richer in-memory store object also carries
 `topups[]` and `lastObservedBalance`, which live for the page lifetime but are dropped on write; do not
 build features that assume either survives a refresh without changing the writer.
+
+Two writers touch a record, and **both are lossless**. `observeRead` mutates the record in the store
+object and hands the whole store to `writeStore`, so it carries every field. `persistTracker` (used by
+`checkoutSession`) reads the record already on disk, takes it as the merge base
+(`{ ...(store.sessions[id] ?? {}) }`), and only overwrites a field the caller actually holds: `baseline`
+always (it returns early without one), `spent` only when numeric, `lastRead` / `lastBalance` only when
+numeric, plus `ts`. So it neither drops `lastRead` nor writes `lastBalance: undefined` — a value
+`JSON.stringify` would silently delete. Extend every writer whenever you add a per-session field — see §5.
 
 **Pruning (on every write):** drop entries whose `ts` is not a number or is older than 30 days
 (`TRACKER_MAX_AGE_MS`), sort the rest by `ts` descending, keep at most 30 (`TRACKER_MAX_SESSIONS`).
@@ -246,6 +276,25 @@ keeps working.
   backwards for a while, and because both formulas look plausible, only a concrete before/after example
   catches it. The same applies to the two copies of the apportionment formula (§3), which can silently
   drift apart.
+- **A lossy record round trip silently ate real spending — in two places.** `createTracker` used to map
+  only a subset of fields. When `lastRead` was added, that field was dropped on the read → modify → write
+  round trip, so `previousBalanceOf` fell back to `lastBalance` — an *event* balance that other sessions
+  also write — and swallowed a whole window of genuine spending. `persistTracker` had the same class of
+  bug from the other end: it rebuilt the record from a fixed field list (`baseline`, `lastBalance`,
+  `spent`, `ts`), so it dropped `lastRead` as well and additionally wrote `lastBalance: undefined`, which
+  `JSON.stringify` deletes outright. Nothing in the UI said so; the counter simply under-reported. Both
+  writers are fixed, and the fix is the same property in each: `createTracker` spreads the persisted
+  record and only fills defaults, and `persistTracker` merges into the on-disk record as its base and
+  only overwrites fields the caller holds. That is why the invariant is written down twice — here and in
+  §4: **any writer that rebuilds a record from a fixed field list is lossy.** When you add a per-session
+  field, extend every writer that touches the record.
+- **A single bridge field carrying two meanings was a dead end.** An earlier attempt to recover "spending
+  that happened before the external change was observed" added a reanchor-bridge field that stood for
+  both "the balance this session last read" *and* "the balance at the event". The two meanings are
+  written by different actors — the session's own reads versus a possibly different session's event — so
+  the field was repeatedly clobbered and real spending was lost again. `lastRead` carries exactly one
+  meaning, and the fallback chain in `previousBalanceOf` keeps the other values as read-only legacy
+  fallbacks. Do not reintroduce a dual-purpose field.
 - **`HUD_VERSION` and stray comments.** `HUD_VERSION` is a leftover diagnostic constant that used to be
   shown in a native tooltip; it is now unreferenced — either wire it into the panel or drop it, but do not
   reintroduce `title`. Likewise, several comments (and older docs) still say the balance is polled every
@@ -276,7 +325,7 @@ keeps working.
 - Fakes for `fetch` (per-mode host responses), `localStorage` and `document` (visibility plus pointer
   events). The fetch mock throws on any URL other than the two plugin routes and on any method other than
   `GET` — a regression guard for the relay contract.
-- It prints one `✓` line per check (47 of them) and throws on the first failure.
+- It prints one `✓` line per check (53 of them) and throws on the first failure.
 
 Regression guards worth knowing, because each encodes a deliberate decision:
 
@@ -287,8 +336,11 @@ Regression guards worth knowing, because each encodes a deliberate decision:
 | Card money = 2 decimals, panel money = 4, `<¥0.01` / `<¥0.0001` sentinels | Sub-cent spending must never read as `0.00` |
 | Hover opens; crossing to the panel keeps it open; leaving the **left** edge of card *or* panel closes it | The non-rectangular hover surface in §5 |
 | Refresh shows "refreshing…" then an `updated HH:MM:SS` stamp; manual top-up shows "querying…" | Buttons need visible, work-backed feedback |
-| A top-up raises the balance but leaves `spent` unchanged, and spending continues afterwards; `reanchorAll` moves **all** sessions' baselines and none of their counters | The core promise of the current model, with an account-wide balance |
-| Counter survives a simulated refresh; per-session records do not cross; `classifyRead` maps decrease/rise/tolerance correctly | Persistence and the classifier |
+| A top-up raises the balance but leaves `spent` unchanged, and spending continues afterwards; `applyExternalChange` moves **all** sessions' baselines and none of their counters | The core promise of the current model, with an account-wide balance |
+| Bonus expiry: a drop beyond the token bound classifies as `expire`, leaves `spent` unchanged, moves the baseline down, and spending resumes normally afterwards; a drop *within* the bound — including exactly at the bound — still counts as `spend` | The regression guard for the reduction direction, i.e. the reason the bound is applied both ways |
+| An expiry triggered from session A moves every session's baseline but not their counters; session B, which has not read since, still compares against **its own** `lastRead` and charges its own ¥5.50 to spending | Pins `previousBalanceOf`'s preference for `lastRead` and the multi-session self-heal |
+| Counter survives a simulated refresh; per-session records do not cross; `classifyRead` maps rise/drop/bound/tolerance correctly | Persistence and the classifier |
+| Switching in through `checkoutSession` leaves a session's `baseline` / `lastRead` / `lastBalance` / `spent` untouched, and the persisted blob contains no `undefined` field | The lossless round trip of §4/§5: a record rebuilt from a field list under-reports spending with no visible symptom |
 | v3 / v2 / v1 migration, 30-day pruning, 30-session cap, no-`localStorage` degradation | Upgrade safety |
 | Returning to the foreground triggers an immediate refetch | Visibility handling |
 
