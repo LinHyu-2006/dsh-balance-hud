@@ -491,7 +491,7 @@ for (let i = 0; i < cells.length; i += 1) {
     throw new Error(`第 ${i} 格应 ${expected} 对齐，实际 ${cells[i].props.style.textAlign}`);
   }
 }
-console.log(`✓ 布局：两列网格 3 行｜标签 ${labels.join(' / ')}｜数值 ${values.join(' / ')}`);
+console.log(`✓ 布局：两列网格 2 行｜标签 ${labels.join(' / ')}｜数值 ${values.join(' / ')}`);
 
 // 2) 官方价格表口径：flash 闲时
 const flashOff = (u) =>

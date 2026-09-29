@@ -5,12 +5,17 @@ Thanks for looking at this. Issues and pull requests are welcome.
 ## Before you start
 
 ```bash
-node tools/smoke.mjs                      # offline smoke suite, 53 assertions, no DSH needed
+node tools/smoke.mjs                      # offline smoke suite, 64 assertions, no DSH needed
 node tools/verify-install.mjs --package   # packaging self-check, no DSH needed
 ```
 
 Both must exit `0`. The smoke suite is the contract: if you change behaviour, either make the
 suite agree with the new behaviour deliberately, or the suite will tell you what you broke.
+
+CI (`.github/workflows/ci.yml`) runs exactly those two scripts on **ubuntu, windows and macos** with
+Node 20. Both are fully offline — no DSH install, no network, no build step — so the matrix runs in
+clean containers and proves that line endings (`.gitattributes` pins LF), path derivation and
+`import.meta` usage do not depend on Windows. A green run on all three is the bar for a pull request.
 
 ## Ground rules
 
@@ -41,6 +46,20 @@ suite agree with the new behaviour deliberately, or the suite will tell you what
 6. **Write comments that explain *why*, not *what*.** The non-obvious parts of this plugin are all
    "we tried the obvious thing and it was wrong"; record that, or the next person will re-try it.
 7. **Line endings are LF** and are enforced by `.gitattributes`. Don't fight it.
+8. **Never trust persisted user config — validate it field by field at load.** Anything the user can
+   edit (currently the `dsh-balance-hud:settings:v1` blob behind the *Settings → General* row) is
+   untrusted input: a hand-edited value, a field left over from an older version, or corrupt JSON must
+   all fall back to a default rather than reaching the UI or the price table. `normalizeSettings` is
+   the boundary that does this — whitelist every field and re-validate on every read — and
+   `loadSettings` wraps the parse so bad JSON never throws. Add a new setting by adding both its
+   whitelist entry and its default, never by reading the raw object.
+9. **Any new slot registration must be reflected in the smoke suite's registration assertion.** The
+   suite currently expects **exactly two** registrations — `shell.overlay` (`balance-hud`) and
+   `settings.general.item` (`balance-hud-settings`) — asserts the overlay's slot `name` and `id`, and
+   asserts that the settings row is registered. That assertion exists so a registration which silently
+   stops firing (a broken `ctx.slots.inject`, a renamed slot) cannot pass unnoticed, and so nothing
+   takes over a whole settings page by accident. When you legitimately add a third registration, update
+   the count in the same commit.
 
 ## Testing notes
 

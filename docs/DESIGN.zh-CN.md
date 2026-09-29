@@ -206,7 +206,134 @@ if (delta < 0) return { kind: "spend", amount: -delta };   // ❌ 任何下降�
 
 ---
 
-## 4. 持久化：结构、迁移、淘汰
+## 4. 设置、预算与峰时提醒
+
+### 4.1 两个注册点，没有共同的 React 祖先
+
+插件注册了**两个**互相独立的槽位：
+
+| 槽位 | id | 组件 |
+| --- | --- | --- |
+| `shell.overlay` | `balance-hud` | `BalanceHud` —— 钉在右下角的浮层 |
+| `settings.general.item` | `balance-hud-settings` | `BalanceHudSettingsRow` —— 设置里的那一行偏好 |
+
+`settings.general.item` 是 DSH 官方定义的座位：「General 区里的一行偏好 —— 单个设置专用的增量
+座位，不需要独占一整页（要整页请用 `settings.section`）」。DSH 自己的 Language、link-opening、
+performance-usage 几行也注册在这里。插件选"一行"而不是"一页"是刻意的：它只有一组设置，
+不该占一个设置页，而这个槽位本来就是增量式的。
+
+两个注册点渲染在**树的不同位置，没有共同的 React 祖先**，因此无法共享 React state。
+它们改用一个小的订阅容器 —— `createSettingsStore()` 返回 `{ get, set, subscribe }`：
+
+```text
+set(patch) → normalize({ ...current, ...patch }) → 落盘 → 广播给所有订阅者
+```
+
+所以 `set` 会**合并一份部分补丁**（设置行只发它改的那一个字段），再把合并结果广播出去；
+在任一处改，另一处立刻看到同一份对象。`useSettings(store, useState, useEffect)` 是 React 绑定：
+用 `store.get()` 做初值并订阅。这就是两个组件互不依赖的原因 —— 谁先渲染都行，没有任何顺序要求。
+
+### 4.2 边界处收敛：`normalizeSettings`
+
+配置存在 `localStorage` 的 `dsh-balance-hud:settings:v1`，这个键**刻意**与记账键
+`dsh-balance-hud:tracker:v4` 分开，两者不可能互相干扰。从这个键读到的内容一律是
+**不可信输入**：用户可以手改，旧版本也可能留下已经不存在的字段。
+
+`normalizeSettings(raw)` 因此**逐字段对白名单校验**，并返回一个全新对象；`loadSettings()` 把
+`JSON.parse` 包在 `try/catch` 里，所以 JSON 损坏时回落到 `defaultSettings()` 而不是抛错：
+
+| 字段 | 规则 | 违规时 |
+| --- | --- | --- |
+| `model` | 必须在 `MODEL_CHOICES` 里 | 回落 `deepseek-flash` |
+| `pollSeconds` / `hiddenPollSeconds` | 必须在 `POLL_CHOICES`（30/60/120/300）里 | 回落 60 / 300 |
+| `showAccountTotal` / `notifyBudget` / `notifyPeak` | 必须是真正的布尔 | 回落默认 |
+| `sessionBudget` | 有限数字，0–100000 | 回落 0（不设） |
+| `dailyBudget` | 有限数字，0–1000000 | 回落 0（不设） |
+| `peakWarnMinutes` | 必须在 `PEAK_WARN_CHOICES`（5/10/15/30）里 | 回落 10 |
+
+这条规则可以推广：**凡是用户可写、且随版本变化的数据，每次读取都必须重新校验，永不信任。**
+脏值绝不能把 HUD 弄崩，也绝不能流进价格表。
+
+### 4.3 预算模型：为什么是描边，而不是多一格
+
+```text
+evaluateBudget(spent, budget) → { level, ratio, remaining }
+  budget <= 0 或 spent 不是数字 → { level: 'none', ratio: 0, remaining: undefined }
+  ratio >= 1.00 → 'over'    ratio >= 0.90 → 'critical'    ratio >= 0.75 → 'warn'    否则 'none'
+  remaining = max(0, budget − spent)
+worstBudgetLevel([本会话, 每日]) → 取更严重的一条
+```
+
+`BUDGET_STEPS` 从高到低匹配，所以 1.2 的比率是 `over` 而不是 `warn`。`remaining` 夹在 0 以上 ——
+"剩余 -3 元"不是有用的信息。卡片的颜色取自 `worstBudgetLevel`，而不是只看本会话预算：
+今天已经用爆、本会话还很便宜时，照样告警。
+
+**视觉上是 3 px 的彩色左边框，刻意不是网格里的第五格。** 卡片是两列网格，行只有
+`账户余额` / `本会话预估`，而冒烟测试断言"恰好 4 格 + 这两个标签"。为了一个瞬时状态把网格撑大
+会破坏这个对齐契约 —— 用强调色表达更合适。描边用现成的主题变量
+（warn / critical 用 `--dsw-alias-label-warning`，over 用 `--dsw-alias-label-error`），
+并用 `paddingLeft` 补偿，所以它出现时文字不会位移。
+
+系统通知这条路是**可选且有界的**：`notifyBudget` 默认 `false`，发送需要
+`Notification.permission === 'granted'`，并用一个 `Set` 保证**每个档位在本次挂载内最多一条**。
+预算超限持续一小时也只通知一次，而不是每次轮询都弹；没有权限时静默降级为只有描边。
+
+### 4.4 每日台账：北京自然日 + 只吃确认花费
+
+键 `dsh-balance-hud:daily:v1`，形状 `{ date, total }`：
+
+```text
+beijingDateKey(now)   → 北京自然日的 'YYYY-MM-DD'（UTC+8，不引时区库）
+loadDaily()           → 存的日期 ≠ 今天：写回 { today, 0 } 并返回 0
+addDailySpent(amount) → amount > 0 ? total + amount : 不变
+```
+
+两个决定值得记下来：
+
+- **用北京日，不用本地日。** 官方计价档位与计费窗口都按北京时间，日预算的日界必须同一个口径。
+  按本地午夜归零，对大多数用户来说会在北京峰时段的中间翻篇。
+- **只吃确认花费。** `addDailySpent` 只有一个调用点：余额 effect 里
+  `verdict.kind === 'spend' && verdict.amount > 0` 的分支 —— 也就是某次真实余额读数**确认**为消费的
+  金额。它绝不接受卡片上那个递推显示值 `ownEstimate`：那个值在两次读数之间平滑增长，
+  每次滴答都会把同一笔钱再加一遍。非正数一律忽略，所以充值或 `expire` 不可能给当天做加减。
+
+因为 `loadDaily` 在日期不同时会重写记录，第二天早上打开 HUD 就是从 0 开始，不需要任何重置任务。
+台账只有一条记录、不是历史 —— 只有"今天"对日预算有意义。
+
+### 4.5 峰谷倒计时的算法
+
+`minutesUntilTierChange(now)` 返回 `{ minutes, to }`，`to` 为 `'peak'`（下一次切换进入峰时）
+或 `'off'`（下一次切换回到闲时）。峰时是北京时间**周一至周五 09:00–12:00 与 14:00–18:00**；
+`PRICES` 里峰时价恰好是闲时的 **2 倍**，所以这个倒计时是实打实的省钱信息。
+
+所有换算走 `beijingClock(now) → { minutes, day }`（北京当天分钟数 + 星期），分支是：
+
+| 情况 | 结果 | `to` |
+| --- | --- | --- |
+| 工作日 09:00 前 | 09:00 − now | `peak` |
+| 09:00–12:00 | 12:00 − now | `off` |
+| 12:00–14:00（午休） | 14:00 − now | `peak` |
+| 14:00–18:00 | 18:00 − now | `off` |
+| 工作日 18:00 后 | 绕到次日 09:00 | `peak` |
+| 周六 | 到周一 09:00（2 天） | `peak` |
+| 周日 | 到周一 09:00（1 天） | `peak` |
+
+几个例子（冒烟测试全都钉住了）：周五 18:30 → 周一 09:00 是 `24*60 − 1110 + 540` = **870 分钟**；
+周六 12:00 → 周一 09:00 是 **2700 分钟**（45 小时）；周一 09:30 → 12:00 是 **150 分钟**（`off`）；
+周一 17:50 → 18:00 是 **10 分钟**（`off`）。
+
+> **为什么周末要单独一个分支。** 工作日只要在 `PEAK_WINDOWS` 里找"开始时间大于当前分钟"的那一段
+> 就够了；周末当天根本没有时段，所以代码显式跳到周一 09:00（`day === 6 ? 2 : 1` 天，减去当前
+> 分钟偏移，再加 540）。这里写错的话周一到周五完全看不出来，一到周末就全错。
+
+一个固定的 **60 秒滴答**（`setInterval(…, 60000)`）递增时钟 state 并重读 `loadDaily()`，
+因此倒计时与跨天重置都是活的，不需要额外的调度逻辑。面板只在 `notifyPeak` 打开、且下一次切换
+落在 `peakWarnMinutes` 以内时显示提醒：`to === 'peak'` 显示
+`约 N 分钟后进入峰时，价格翻倍`，`to === 'off'` 显示 `约 N 分钟后回到闲时价`。
+
+---
+
+## 5. 持久化：结构、迁移、淘汰
 
 键：`dsh-balance-hud:tracker:v4`
 
@@ -250,47 +377,47 @@ if (delta < 0) return { kind: "spend", amount: -delta };   // ❌ 任何下降�
 
 ---
 
-## 5. 踩过的坑
+## 6. 踩过的坑
 
 按"下次最容易再踩"排序。
 
-**5.1 共享状态用普通对象 → 不会触发重渲染。**
+**6.1 共享状态用普通对象 → 不会触发重渲染。**
 `baselineStage.store` 是个普通 JS 对象（跨闭包共享），改它 React 不会重渲染。
 而"哪些会话参与分摊"正是渲染时读 store 得到的。结果：切到新会话后分母没更新 →
 占比恒为 100% → **每个会话显示同一个数**。修法是加一个 `epoch` 版本号 state，
 store 一变就 `bumpEpoch()`。
 
-**5.2 `Math.min` / `Math.max` 的方向，在中文语义下极易混。**
+**6.2 `Math.min` / `Math.max` 的方向，在中文语义下极易混。**
 "最早的锚点"因为余额单调下降而等于数值**最大**的锚点。
 `Math.min([50, 49.2])` 用中文念"最小值"时，和"最早"在脑子里是同一个位置。
 写代码时一定要把物理含义（"余额越早越高"）写进注释，
 单锚点用例还会掩盖这个 bug（`Math.min([50]) === Math.max([50])`）。
 
-**5.3 同一份口径写两遍 → 迟早漂移。**
+**6.3 同一份口径写两遍 → 迟早漂移。**
 曾经既在渲染路径里算分摊、又注入一个 `apportionedDelta` 函数在别处算，
 两份实现一旦有一处改动就会出现"代码里是 A、界面跑的是 B"。
 现在只保留渲染路径一份，注入的重复实现已删除。**加新功能时不要复制口径。**
 
-**5.4 测试框架的 `useRef` 替身忽略了初值。**
+**6.4 测试框架的 `useRef` 替身忽略了初值。**
 替身写成 `{ current: null }`，而真实 React 会执行 `useRef(initialValue)`。
 在组件开始依赖 `useRef({...})` 的初值之前，这个差异一直潜伏；
 一旦依赖就崩。替身必须尊重初值，否则测试环境与真实运行时行为不一致。
 
-**5.5 测试跑得比真实环境快，会观察不到中间态。**
+**6.5 测试跑得比真实环境快，会观察不到中间态。**
 `查询中…` 这类中间状态在 mock 里因为 fetch 立即返回而被同一批微任务收尾，
 根本观察不到。用**挂起**的请求（`bonusMode = 'hang'`）才能稳定断言。
 要注意区分：这是测试太快，不是功能缺失。
 
-**5.6 原生 `title` 属性会毁掉 HUD。**
+**6.6 原生 `title` 属性会毁掉 HUD。**
 悬停约一秒后浏览器弹出不透明黑框，正好盖住面板。全插件**不得有** `title`，
 摘要写在 `aria-label` 里，并由冒烟测试当回归守卫断言。
 
-**5.7 悬停判定不能挂在容器盒子上。**
+**6.7 悬停判定不能挂在容器盒子上。**
 容器在四周预留了空白（8px 间隔 + 布局余量），挂容器上会让面板停在
 "其实已经离开卡片"的空白处不消失。判定必须挂在卡片和面板**各自**身上，
 并配一个 140ms 的待关闭定时器，让指针穿过 8px 间隔时面板的 enter 取消卡片的 leave。
 
-**5.8 持久化层曾经是"有损"的 —— 两个写入方都漏字段。**
+**6.8 持久化层曾经是"有损"的 —— 两个写入方都漏字段。**
 第一处：`createTracker` 把磁盘字段 `lastBalance` 改名成 `last`，并且只映射了当时存在的几个字段。
 后来给记录加了 `lastRead`，`readStore()` 能读到、但 `observeRead` 拿到的对象里没有它，
 于是 `previousBalanceOf` 退化成用**事件余额**当上次读数，把整段真实消费判成外部变动**吞掉**。
@@ -300,8 +427,8 @@ store 一变就 `bumpEpoch()`。
 教训：持久化记录在"读—改—写"之间必须**无损**；写入方要以磁盘上已有的那条为基底，
 只覆盖自己确实持有的字段。现在两个写入方都遵守这条，并各有一个回归断言钉着。
 
-**5.9 一个字段塞两种含义，必然出错。**
-修 5.8 的过程中我加过一个"重锚桥"字段 `reanchor`，想让它在外部变动后
+**6.9 一个字段塞两种含义，必然出错。**
+修 6.8 的过程中我加过一个"重锚桥"字段 `reanchor`，想让它在外部变动后
 充当"上次读数"。问题是它同时被当成"变动前的余额"和"上次读数"用，
 于是每次修一个方向就从另一个方向漏水，来回改了四五轮。
 最后把它整个删掉，只留 `lastRead` 一个字段承载一种含义，代码立刻变简单且正确。
@@ -309,10 +436,10 @@ store 一变就 `bumpEpoch()`。
 
 ---
 
-## 6. 测试策略
+## 7. 测试策略
 
 ```bash
-node tools/smoke.mjs                      # 离线，53 条断言，不需要装 DSH
+node tools/smoke.mjs                      # 离线，64 条断言，不需要装 DSH
 node tools/verify-install.mjs --package   # 打包自检（清单 / patch / 两份入口）
 node tools/verify-install.mjs             # 校验真实安装
 ```
@@ -322,9 +449,11 @@ node tools/verify-install.mjs             # 校验真实安装
 它带假的 React、假 fetch、假 `localStorage`、假 `document`，
 **完全离线**，不依赖 DSH 安装。
 
-**它覆盖**：模块/槽位注册形状、卡片两列网格、悬停与折叠交互（含跨间隔、左侧滑出）、
+**它覆盖**：模块/槽位注册形状（**两个**注册点）、卡片两列网格、悬停与折叠交互（含跨间隔、左侧滑出）、
 余额三态与全部路由失败模式、四类计价与峰谷、显示精度与 `<¥0.01` 哨兵、
-充值**与过期**两类外部变动判据、持久化与 v1→v4 迁移链、可见性补读。
+充值**与过期**两类外部变动判据、持久化与 v1→v4 迁移链、可见性补读，以及设置（默认值 /
+脏配置收敛 / 落盘往返 / 容器广播与部分合并 / 损坏回落）、预算四档与剩余夹 0、两条预算取最严重、
+每日台账（累加 / 忽略 0 与负数 / 跨天归零 / 损坏回落）、峰谷倒计时（峰时 / 闲时 / 午休 / 跨周末）。
 
 **它不覆盖**：Host 半边（`lib/index.js` 从不加载）、真实浏览器、真实 Cordis 注入、
 真实平台。所以**改了 Host 半边必须手工验证并重启 DSH**。
@@ -342,6 +471,16 @@ node tools/verify-install.mjs             # 校验真实安装
   `spent` 必须一字不变，且持久化内容里不得出现 `undefined`
 - `tokensOf` 与 `costOf` 口径一致，且峰时价 > 闲时价
 - `查询中…` 状态出现且按钮 disabled，并且确实调用了赠金路由
+- **槽位注册恰好两个** —— `shell.overlay`（id `balance-hud`）与 `settings.general.item`
+  （id `balance-hud-settings`）；浮层的槽位名与 id 被校验，设置行至少断言"确实注册了"
+  （新注册点必须同步改这条，见 CONTRIBUTING）
+- **设置**：默认值（flash / 60 秒 / 不设预算）、脏配置逐字段收敛而合法值不动、落盘往返、
+  容器广播 + 部分合并 + 取消订阅、配置损坏回落默认且不抛错（§4.2 的边界规则）
+- **预算**：75% → `warn`、90% → `critical`、≥100% → `over`、`remaining` 夹到 0，
+  且两条预算取最严重的一条（§4.3）
+- **每日台账**：累加确认花费、忽略 0 与负数、北京日期变化时归零、内容损坏回落 0（§4.4）
+- **峰谷倒计时**：峰前、峰后、跨午休，以及周五 18:30 → 周一 09:00（§4.5 的跨夜与跨周末分支 ——
+  这里写错的话周一到周五完全看不出来）
 
 > 写这些用例时踩过一个坑：给"B 消费了 5.5 元"的用例传了 **token 上界 = 0**，
 > 于是按判据它必然被判成 `expire`（降幅超过上界），测试反而断言失败。
@@ -357,6 +496,8 @@ node tools/verify-install.mjs             # 校验真实安装
 | `lib/client.js` → `formatMoney` / `formatCostShort` / `formatCost` | 2 位 / 4 位显示与哨兵 |
 | `lib/client.js` → `readBalance` / `readBonuses` | 两条回环路由的客户端封装 |
 | `lib/client.js` → `readStore` / `writeStore` / `classifyRead` / `previousBalanceOf` / `observeRead` / `applyExternalChange` | 记账核心（纯逻辑，好测） |
-| `lib/client.js` → `BalanceHud` | 组件：布局、交互、轮询 |
+| `lib/client.js` → `defaultSettings` / `normalizeSettings` / `loadSettings` / `saveSettings` / `createSettingsStore` / `useSettings` | 设置：配置容器与逐字段收敛（§4.1 / §4.2） |
+| `lib/client.js` → `evaluateBudget` / `worstBudgetLevel` / `beijingDateKey` / `loadDaily` / `addDailySpent` / `minutesUntilTierChange` | 预算与峰谷（§4.3–§4.5） |
+| `lib/client.js` → `BalanceHud` / `BalanceHudSettingsRow` | 组件：浮层与设置行（两个独立注册点，共享配置容器） |
 | `lib/client.js` → `exports.__test` | 导出给冒烟测试的纯函数 |
 | `lib/index.js` | Host 半边：两条路由 + 归一化 |

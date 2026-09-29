@@ -19,10 +19,13 @@ DeepSeek **account balance** and the **cost of the current session**.
 - **No credentials, no outbound network of its own** — the plugin never touches your API key.
 - **Two halves, one relay** — a browser half renders the HUD; a Host half exposes two read-only
   loopback HTTP routes so the browser can read the balance.
+- **Configurable, and budgeted** — a preference row in *Settings → General* sets the model, the poll
+  intervals, the budgets and the warnings; the card gains a coloured edge as spending approaches a
+  budget, and the panel counts down to the next peak/off-peak switch.
 
 ```bash
 node tools/install.mjs    # install into ~/.dsh/profiles/desktop, then restart DSH
-node tools/smoke.mjs      # offline smoke suite (53 assertions), no DSH install needed
+node tools/smoke.mjs      # offline smoke suite (64 assertions), no DSH install needed
 ```
 
 ## The HUD
@@ -70,6 +73,96 @@ panel, so real spending is never rounded down to a flat zero.
 - **There are deliberately no `title` attributes anywhere in the HUD.** A native browser tooltip
   appears as an opaque black box about a second after hover and covers the panel, so the summary
   lives in `aria-label` instead — asserted by the smoke suite as a regression guard.
+
+## Settings
+
+The plugin contributes **one preference row** — `余额与花费 HUD` — to the DSH slot
+`settings.general.item`, which DSH declares as *"one preference row inside the General section — the
+additive seat for a single setting that needs no page of its own"* (a whole page is
+`settings.section`; the same slot carries DSH's own Language, link-opening and performance-usage
+rows). Find it at **Settings → General → 余额与花费 HUD**. It does **not** take over a whole settings
+page.
+
+| Setting | Values | Default | Effect |
+| --- | --- | --- | --- |
+| Model (`计价模型`) | `deepseek-flash`, `deepseek-v4-pro` | `deepseek-flash` | Price table used for the estimate and the apportionment weights |
+| Foreground poll interval (`前台刷新间隔`) | 30 / 60 / 120 / 300 s | 60 s | Balance poll cadence while the page is visible |
+| Hidden interval (`后台（页面隐藏）`) | 30 / 60 / 120 / 300 s | 300 s | Balance poll cadence while the page is hidden |
+| Peak-warning lead time (`峰前提醒`) | 5 / 10 / 15 / 30 min | 10 min | How early the peak/off-peak warning appears |
+| Session budget (`本会话预算（元）`) | CNY, `0` = unset | 0 | Budget for this session's estimated spend |
+| Daily budget (`每日预算（元）`) | CNY, `0` = unset | 0 | Budget for the Beijing-day confirmed spend |
+| Show account total row (`显示账户级合计`) | on / off | on | `Account total` row in the panel when parallel sessions exist |
+| Peak warnings (`峰时提醒`) | on / off | on | The peak/off-peak warning line in the panel |
+| System notification on budget breach (`预算超限发系统通知`) | on / off | off | Optional `Notification` when a budget level is first reached |
+
+The shipped row is labelled in Chinese; the English names above are what each control means.
+
+**Persistence.** The row writes the `localStorage` key `dsh-balance-hud:settings:v1` — deliberately
+**separate** from the accounting key (`dsh-balance-hud:tracker:v4`), so the two can never interfere.
+
+**Two registrations, one container.** The settings row (`settings.general.item`) and the HUD overlay
+(`shell.overlay`) are **two independent slot registrations with no common React ancestor**, so they
+cannot share React state. They share a small subscription container instead —
+`createSettingsStore` → `get` / `set` / `subscribe`: `set` merges a partial patch, persists it and
+broadcasts, so editing in either place updates the other immediately — no reload, no shared parent.
+`useSettings` is the React binding on top of the same container.
+
+**Dirty config is never trusted.** `normalizeSettings` validates **field by field against
+whitelists**: an unknown model, an interval outside the choices, a negative budget or a non-boolean
+toggle falls back to the default rather than propagating into the UI. Corrupt JSON in `localStorage`
+also falls back to defaults instead of throwing. The config is user-writable and version-dependent,
+so it is re-validated on every read.
+
+## Budgets
+
+Set a **session budget** and/or a **daily budget** (CNY; `0` means unset) in the settings row.
+
+`evaluateBudget(spent, budget)` returns `{ level, ratio, remaining }`, with `level` one of
+`none | warn | critical | over`:
+
+| Usage | Level |
+| --- | --- |
+| < 75 % | `none` |
+| ≥ 75 % | `warn` |
+| ≥ 90 % | `critical` |
+| ≥ 100 % | `over` |
+
+`remaining` is clamped at 0, so "over budget" never reports a negative remainder. `worstBudgetLevel`
+then picks the more severe of the session and daily budgets, so an exhausted daily budget still warns
+while the session itself is cheap.
+
+**Visual.** When a budget is at or over a threshold the card gets a **coloured 3 px left border** —
+`warn` / `critical` use the theme warning colour, `over` the error colour. It is deliberately **not**
+an extra grid cell: the card grid must stay **2 columns × 2 rows**, and the smoke suite pins that with
+an assertion. The expanded panel adds a budget line showing spent / budget and either the remaining
+amount or `已超限` (over budget).
+
+**Optional system notification.** With *system notification on budget breach* enabled (off by
+default), each level fires **at most once per mount**, so it cannot become a nag. It uses the browser
+`Notification` API and only sends when permission has been granted; if it has not, the plugin silently
+degrades to the coloured border only.
+
+**The daily budget uses a per-day ledger.** The `localStorage` key `dsh-balance-hud:daily:v1` holds
+`{ date, total }`, where `date` is the **Beijing** calendar day (`beijingDateKey`) — the official
+billing and peak windows are both Beijing-based, so the day boundary follows the same clock. It only
+accumulates **confirmed** spend — the value a balance read confirmed as spending — never the
+interpolated display value, so the same money cannot be counted twice. Reading on a new day resets it
+to 0.
+
+## Peak-hour warnings
+
+Peak windows are Beijing time **Monday–Friday 09:00–12:00 and 14:00–18:00**, and the peak price is
+exactly **2×** the off-peak price. `minutesUntilTierChange(now)` returns `{ minutes, to }`, where `to`
+is `'peak'` (about to enter the expensive window) or `'off'` (about to return to the cheap one).
+
+The panel shows a warning line when the next tier change falls within the configured lead time:
+
+- `约 N 分钟后进入峰时，价格翻倍` — entering the peak window in about N minutes; the price doubles.
+- `约 N 分钟后回到闲时价` — back to off-peak pricing in about N minutes.
+
+A **60-second tick** drives both the countdown and the daily rollover, so the numbers stay live while
+the page is open. The countdown is correct across the lunch break, overnight and weekends — e.g.
+Friday 18:30 → Monday 09:00 is **870 minutes** — and the smoke suite asserts those cases.
 
 ## The two cost figures
 
@@ -189,9 +282,15 @@ for records migrated from older versions that predate `lastRead`. Old data is mi
 — `v3` was `{ sessions: { … } }`, `v2` a flat `{ [sessionId]: { … } }` dictionary, `v1` a single
 `{ sessionId, … }` record — and the legacy key is removed afterwards.
 
-The balance is polled every **60 seconds** (every 5 minutes while the page is hidden), refetched
-immediately when the page becomes visible, and retried on failure with a 1s → 2s → 5s → 10s → 20s
-backoff. Not being logged in is not an error and does not trigger the fast retry.
+The balance is polled every **60 seconds** (every 5 minutes while the page is hidden) by default,
+refetched immediately when the page becomes visible, and retried on failure with a 1s → 2s → 5s →
+10s → 20s backoff. Not being logged in is not an error and does not trigger the fast retry. Both
+intervals are configurable in the settings row (see [Settings](#settings)).
+
+Two more keys exist alongside the accounting one, and they are **independent** of it:
+`dsh-balance-hud:settings:v1` (the preference row, see [Settings](#settings)) and
+`dsh-balance-hud:daily:v1` (the Beijing-day ledger, see [Budgets](#budgets)). Clearing or corrupting
+one never affects the others.
 
 ## Architecture
 
@@ -236,9 +335,10 @@ exactly half of peak.
   weekends and public holidays) is off-peak; the conversion uses only the local weekday and hour,
   with no timezone library.
 - **Cache writes** are billed at the cache-miss input rate.
-- The model is currently pinned to `deepseek-flash` in the slot injection; `PRICES` in
-  `lib/client.js` already contains both models. Unknown models fall back to flash prices rather than
-  to zero, and the panel says so. After an official price change, edit `PRICES` and refresh the page.
+- The price table holds both models; the **model is a setting** (default `deepseek-flash`), so the
+  estimate and the apportionment weights follow your choice. Unknown models fall back to flash prices
+  rather than to zero, and the panel says so. After an official price change, edit `PRICES` and
+  refresh the page.
 
 ## Install
 
@@ -274,13 +374,24 @@ node tools/verify-install.mjs             # verify a real installation
 
 `tools/smoke.mjs` evaluates the real `lib/client.js` against a fake React runtime, fake host
 responses, a fake `localStorage` and a fake `document`, then drives the component through its hook
-cycle. It prints one `✓` line per check (53 in total) and exits non-zero on the first failure,
+cycle. It prints one `✓` line per check (64 in total) and exits non-zero on the first failure,
 covering module/slot registration, the card layout, hover and fold interaction, the balance
 protocol and every route failure mode, pricing arithmetic, display precision, the external-change
 classifier (top-ups **and** bonus expiry), persistence and the migration chain, and
-visibility-driven refetch. One persistence guard is the lossless round trip: switching sessions
-through `checkoutSession` must leave `baseline` / `lastRead` / `lastBalance` / `spent` untouched, and
-the persisted blob must contain no `undefined` field.
+visibility-driven refetch. The A1–A3 features have their own guards: the **two** slot registrations
+(the overlay *and* the settings row), settings defaults, the field-by-field sanitising of dirty
+config, the persistence round trip, container broadcast with partial merge and unsubscribe, the
+corrupt-config fallback, the four budget levels with clamping, most-severe-of-two selection, the
+daily ledger (accumulate / ignore 0 and negatives / cross-day reset / corrupt fallback), and the peak
+countdown across peak, off-peak, lunch break and weekend. One persistence guard is the lossless round
+trip: switching sessions through `checkoutSession` must leave `baseline` / `lastRead` / `lastBalance` /
+`spent` untouched, and the persisted blob must contain no `undefined` field.
+
+CI (`.github/workflows/ci.yml`) runs both offline scripts — `node tools/smoke.mjs` and
+`node tools/verify-install.mjs --package` — on **ubuntu, windows and macos** with Node 20. Neither
+script needs a DSH install, network access or a build step, so the matrix runs in clean containers and
+proves that line endings (`.gitattributes` pins LF), path derivation and `import.meta` usage do not
+depend on Windows.
 
 It does **not** cover the Host half (`lib/index.js` is never loaded), a real browser, real Cordis
 injection, or the real platform. `lib/client.js` is a hand-written CJS-style bundle in the official
@@ -290,8 +401,9 @@ injection, or the real platform. `lib/client.js` is a hand-written CJS-style bun
 | --- | --- |
 | `package.json` + `cordis.patch.yml` | Declare `dsh.bundle.patch` and `dsh.client` (`platform: web`, exports `./client`), and insert the plugin into the profile entry tree |
 | `lib/index.js` | Host half: the two read-only loopback routes |
-| `lib/client.js` | Browser half: the `shell.overlay` HUD and all of the accounting |
+| `lib/client.js` | Browser half: the `shell.overlay` HUD, the `settings.general.item` row and all of the accounting |
 | `tools/` | Installer, installation verifier, offline smoke suite |
+| `.github/workflows/ci.yml` | Offline smoke suite + packaging self-check on ubuntu / windows / macos |
 | `docs/DESIGN.md` | Contributor design note — the accounting model in full ([简体中文](docs/DESIGN.zh-CN.md)) |
 
 ## Privacy and security

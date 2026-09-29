@@ -209,7 +209,151 @@ render — writing refs during render risks reading a half-updated state.
 
 ---
 
-## 4. Persistence: schema, migration, pruning
+## 4. Settings, budgets and peak warnings
+
+### 4.1 Two slot registrations, no common React ancestor
+
+The plugin registers **two** independent slots:
+
+| Slot | Id | Component |
+| --- | --- | --- |
+| `shell.overlay` | `balance-hud` | `BalanceHud` — the fixed bottom-right overlay |
+| `settings.general.item` | `balance-hud-settings` | `BalanceHudSettingsRow` — the preference row |
+
+`settings.general.item` is DSH's declared seat for *"one preference row inside the General section —
+the additive seat for a single setting that needs no page of its own (a whole page is
+`settings.section`)"* — the same slot DSH uses for its own Language, link-opening and
+performance-usage rows. Taking a row rather than a page is deliberate: this plugin owns one small
+setting cluster, not a settings surface, and the slot is explicitly additive.
+
+The two registrations render into **different parts of the tree and share no React ancestor**, so they
+cannot share React state. They share a small subscription container instead — `createSettingsStore()`
+returns `{ get, set, subscribe }`:
+
+```text
+set(patch) → normalize({ ...current, ...patch }) → save → broadcast to every listener
+```
+
+`set` therefore **merges a partial patch** — the row sends only the field it edited — and broadcasts
+the merged result, so editing in either place updates the other immediately and both read the same
+object. `useSettings(store, useState, useEffect)` is the React binding: it seeds from `store.get()`
+and subscribes. That is why neither component needs the other as a parent, and why the row may render
+before the overlay (or vice versa) with no ordering rule to maintain.
+
+### 4.2 Sanitise at the boundary: `normalizeSettings`
+
+The settings blob lives in `localStorage` under `dsh-balance-hud:settings:v1` — a key deliberately
+**separate** from the accounting key `dsh-balance-hud:tracker:v4`, so the two can never interfere.
+Everything read from it is **untrusted input**: the user can edit it by hand, and an older version can
+leave behind fields that no longer exist.
+
+`normalizeSettings(raw)` therefore validates **field by field against whitelists** and returns a fresh
+object; `loadSettings()` wraps the parse in `try/catch`, so corrupt JSON falls back to
+`defaultSettings()` instead of throwing:
+
+| Field | Rule | On violation |
+| --- | --- | --- |
+| `model` | must be in `MODEL_CHOICES` | default `deepseek-flash` |
+| `pollSeconds`, `hiddenPollSeconds` | must be in `POLL_CHOICES` (30/60/120/300) | 60 / 300 |
+| `showAccountTotal`, `notifyBudget`, `notifyPeak` | must be a real boolean | defaults |
+| `sessionBudget` | finite number, 0–100 000 | 0 (unset) |
+| `dailyBudget` | finite number, 0–1 000 000 | 0 (unset) |
+| `peakWarnMinutes` | must be in `PEAK_WARN_CHOICES` (5/10/15/30) | 10 |
+
+The rule generalises: **anything user-writable and version-dependent is re-validated on every load and
+never trusted.** A dirty value must never be able to crash the HUD or reach the price table.
+
+### 4.3 The budget model, and why the card gets a border instead of a cell
+
+```text
+evaluateBudget(spent, budget) → { level, ratio, remaining }
+  budget <= 0 or spent not a number → { level: 'none', ratio: 0, remaining: undefined }
+  ratio >= 1.00 → 'over'    ratio >= 0.90 → 'critical'    ratio >= 0.75 → 'warn'    else 'none'
+  remaining = max(0, budget − spent)
+worstBudgetLevel([session, daily]) → the more severe of the two
+```
+
+`BUDGET_STEPS` is checked highest-first, so a ratio of 1.2 is `over`, not `warn`. `remaining` is
+clamped at 0, because a negative remainder is never a useful thing to show. The card colours itself
+from `worstBudgetLevel`, not from the session budget alone: an exhausted daily budget warns even when
+this session is still cheap.
+
+**The visual is a 3 px coloured left border, deliberately not a fifth grid cell.** The card is a
+two-column grid whose rows are `Balance` / `Session est.`, and the smoke suite asserts exactly four
+cells and those two labels. Growing the grid to carry a budget cell would break that alignment
+contract for a state that is transient and better expressed as emphasis. The border uses the existing
+theme variables (`--dsw-alias-label-warning` for warn/critical, `--dsw-alias-label-error` for over)
+and compensates with `paddingLeft`, so the text does not shift when it appears.
+
+The notification path is **optional and bounded**: `notifyBudget` defaults to `false`, sending needs
+`Notification.permission === 'granted'`, and a `Set` of already-notified levels keeps it to **at most
+one notification per level per mount**. A budget that stays over for an hour therefore notifies once,
+not on every poll; if permission is missing the plugin silently keeps the border only.
+
+### 4.4 The daily ledger is a Beijing day fed by *confirmed* spend
+
+Key `dsh-balance-hud:daily:v1`, shape `{ date, total }`:
+
+```text
+beijingDateKey(now)   → 'YYYY-MM-DD' for the Beijing calendar day (UTC+8; no timezone library)
+loadDaily()           → if the stored date ≠ today: write { today, 0 } and return 0
+addDailySpent(amount) → amount > 0 ? total + amount : unchanged
+```
+
+Two decisions matter:
+
+- **Beijing day, not the local day.** The official price tiers and billing windows are all
+  Beijing-based, so the daily-budget boundary must use the same clock. A local-midnight reset would
+  roll the day over in the middle of a Beijing peak window for most users.
+- **Confirmed spend only.** `addDailySpent` has exactly one caller: the balance effect, guarded by
+  `verdict.kind === 'spend' && verdict.amount > 0` — the amount a realised balance read **confirmed**
+  as spending. It is never fed the interpolated `ownEstimate` shown on the card: that value grows
+  smoothly between reads, so adding it here would re-count the same money on every tick. Non-positive
+  amounts are ignored, so a `topup` or an `expire` classification can neither add to nor subtract from
+  the day.
+
+Because `loadDaily` rewrites the record whenever the stored date differs, opening the HUD the next
+morning starts the day at 0 with no reset job of its own. The ledger is a single record, not a
+history — only "today" is meaningful to the daily budget.
+
+### 4.5 Peak countdown maths
+
+`minutesUntilTierChange(now)` returns `{ minutes, to }`, where `to` is `'peak'` (the next change enters
+peak) or `'off'` (the next change returns to off-peak). Peak windows are Beijing **Mon–Fri
+09:00–12:00 and 14:00–18:00**, and peak price is exactly **2×** off-peak in `PRICES`, so the countdown
+is real money information.
+
+All arithmetic goes through `beijingClock(now) → { minutes, day }` (minutes since Beijing midnight plus
+the weekday). The cases:
+
+| Situation | Result | `to` |
+| --- | --- | --- |
+| Weekday before 09:00 | 09:00 − now | `peak` |
+| 09:00–12:00 | 12:00 − now | `off` |
+| 12:00–14:00 (lunch) | 14:00 − now | `peak` |
+| 14:00–18:00 | 18:00 − now | `off` |
+| Weekday after 18:00 | wrap to tomorrow 09:00 | `peak` |
+| Saturday | to Monday 09:00 (2 days) | `peak` |
+| Sunday | to Monday 09:00 (1 day) | `peak` |
+
+Worked examples, all asserted by the suite: Friday 18:30 → Monday 09:00 is
+`24*60 − 1110 + 540` = **870 minutes**; Saturday 12:00 → Monday 09:00 is **2700 minutes** (45 h);
+Monday 09:30 → 12:00 is **150 minutes** (`off`); Monday 17:50 → 18:00 is **10 minutes** (`off`).
+
+> **Why the weekend gets its own branch.** On a weekday it is enough to search `PEAK_WINDOWS` for the
+> first window start greater than the current minute; on a weekend there is no window at all that day,
+> so the code jumps to Monday 09:00 explicitly (`day === 6 ? 2 : 1` days, minus the current minute
+> offset, plus 540). Getting this wrong is invisible Monday–Friday and wrong all weekend.
+
+A fixed **60-second tick** (`setInterval(…, 60000)`) increments a clock state and re-reads
+`loadDaily()`, so both the countdown and the day rollover stay live without any scheduling logic of
+their own. The panel shows the warning only when `notifyPeak` is on and the next change is within
+`peakWarnMinutes`: `约 N 分钟后进入峰时，价格翻倍` for `to === 'peak'`, and
+`约 N 分钟后回到闲时价` for `to === 'off'`.
+
+---
+
+## 5. Persistence: schema, migration, pruning
 
 Key: `dsh-balance-hud:tracker:v4`. Shape written by `writeStore`:
 
@@ -231,7 +375,7 @@ object and hands the whole store to `writeStore`, so it carries every field. `pe
 (`{ ...(store.sessions[id] ?? {}) }`), and only overwrites a field the caller actually holds: `baseline`
 always (it returns early without one), `spent` only when numeric, `lastRead` / `lastBalance` only when
 numeric, plus `ts`. So it neither drops `lastRead` nor writes `lastBalance: undefined` — a value
-`JSON.stringify` would silently delete. Extend every writer whenever you add a per-session field — see §5.
+`JSON.stringify` would silently delete. Extend every writer whenever you add a per-session field — see §6.
 
 **Pruning (on every write):** drop entries whose `ts` is not a number or is older than 30 days
 (`TRACKER_MAX_AGE_MS`), sort the rest by `ts` descending, keep at most 30 (`TRACKER_MAX_SESSIONS`).
@@ -256,7 +400,7 @@ keeps working.
 
 ---
 
-## 5. Things that bit us
+## 6. Things that bit us
 
 - **The Cordis inject guard.** See §1. The failure that hurt most was not the thrown error but that the
   *other* fix (`inject = ["remote"]`) produced a silently hanging fiber. If the HUD disappears entirely
@@ -286,7 +430,7 @@ keeps working.
   writers are fixed, and the fix is the same property in each: `createTracker` spreads the persisted
   record and only fills defaults, and `persistTracker` merges into the on-disk record as its base and
   only overwrites fields the caller holds. That is why the invariant is written down twice — here and in
-  §4: **any writer that rebuilds a record from a fixed field list is lossy.** When you add a per-session
+  §5: **any writer that rebuilds a record from a fixed field list is lossy.** When you add a per-session
   field, extend every writer that touches the record.
 - **A single bridge field carrying two meanings was a dead end.** An earlier attempt to recover "spending
   that happened before the external change was observed" added a reanchor-bridge field that stood for
@@ -311,7 +455,7 @@ keeps working.
 
 ---
 
-## 6. Testing strategy
+## 7. Testing strategy
 
 `node tools/smoke.mjs` is the workhorse and needs no DSH installation and no network:
 
@@ -325,7 +469,7 @@ keeps working.
 - Fakes for `fetch` (per-mode host responses), `localStorage` and `document` (visibility plus pointer
   events). The fetch mock throws on any URL other than the two plugin routes and on any method other than
   `GET` — a regression guard for the relay contract.
-- It prints one `✓` line per check (53 of them) and throws on the first failure.
+- It prints one `✓` line per check (64 of them) and throws on the first failure.
 
 Regression guards worth knowing, because each encodes a deliberate decision:
 
@@ -334,15 +478,20 @@ Regression guards worth knowing, because each encodes a deliberate decision:
 | No `title` anywhere on the card | The native tooltip black box must not come back |
 | Card is `inline-grid`, two columns, exactly four cells | A previous horizontal layout covered the session list |
 | Card money = 2 decimals, panel money = 4, `<¥0.01` / `<¥0.0001` sentinels | Sub-cent spending must never read as `0.00` |
-| Hover opens; crossing to the panel keeps it open; leaving the **left** edge of card *or* panel closes it | The non-rectangular hover surface in §5 |
+| Hover opens; crossing to the panel keeps it open; leaving the **left** edge of card *or* panel closes it | The non-rectangular hover surface in §6 |
 | Refresh shows "refreshing…" then an `updated HH:MM:SS` stamp; manual top-up shows "querying…" | Buttons need visible, work-backed feedback |
 | A top-up raises the balance but leaves `spent` unchanged, and spending continues afterwards; `applyExternalChange` moves **all** sessions' baselines and none of their counters | The core promise of the current model, with an account-wide balance |
 | Bonus expiry: a drop beyond the token bound classifies as `expire`, leaves `spent` unchanged, moves the baseline down, and spending resumes normally afterwards; a drop *within* the bound — including exactly at the bound — still counts as `spend` | The regression guard for the reduction direction, i.e. the reason the bound is applied both ways |
 | An expiry triggered from session A moves every session's baseline but not their counters; session B, which has not read since, still compares against **its own** `lastRead` and charges its own ¥5.50 to spending | Pins `previousBalanceOf`'s preference for `lastRead` and the multi-session self-heal |
 | Counter survives a simulated refresh; per-session records do not cross; `classifyRead` maps rise/drop/bound/tolerance correctly | Persistence and the classifier |
-| Switching in through `checkoutSession` leaves a session's `baseline` / `lastRead` / `lastBalance` / `spent` untouched, and the persisted blob contains no `undefined` field | The lossless round trip of §4/§5: a record rebuilt from a field list under-reports spending with no visible symptom |
+| Switching in through `checkoutSession` leaves a session's `baseline` / `lastRead` / `lastBalance` / `spent` untouched, and the persisted blob contains no `undefined` field | The lossless round trip of §5/§6: a record rebuilt from a field list under-reports spending with no visible symptom |
 | v3 / v2 / v1 migration, 30-day pruning, 30-session cap, no-`localStorage` degradation | Upgrade safety |
 | Returning to the foreground triggers an immediate refetch | Visibility handling |
+| Exactly **two** slot registrations — `shell.overlay` (id `balance-hud`) and `settings.general.item` (id `balance-hud-settings`) — with the overlay's `name`/`id` asserted and the settings row asserted to be registered | Catches a registration that silently stops firing (a broken `ctx.slots.inject`, a renamed slot). Any new registration must update this count (see CONTRIBUTING) |
+| Settings: defaults are `deepseek-flash` / 60 s / unset budgets; dirty config sanitises field by field while legal values survive; a save/load round trip; the container broadcasts, merges a partial patch and honours `unsubscribe`; corrupt JSON falls back to defaults without throwing | The boundary rule of §4.2 — user-writable config is re-validated on every read, never trusted |
+| Budget: 75 % → `warn`, 90 % → `critical`, ≥ 100 % → `over`, `remaining` clamped at 0, and `worstBudgetLevel` takes the more severe of the session and daily budgets | The thresholds and clamping of §4.3, including the "daily exhausted, session cheap" case |
+| Daily ledger: accumulates confirmed spend, ignores 0 and negative amounts, resets to 0 when the Beijing date changes, and falls back to 0 on corrupt content | The confirmed-spend-only rule and the Beijing day boundary of §4.4 |
+| Peak countdown: entering peak from off-peak, returning to off-peak from peak, across the lunch break, and Friday 18:30 → Monday 09:00 | The overnight and weekend branches of §4.5, which are invisible Monday–Friday |
 
 What it does **not** cover, and where to look instead:
 
