@@ -7,6 +7,14 @@ DeepSeek **account balance** and the **cost of the current session**.
 
 [简体中文说明](README.zh-CN.md) · [Design notes](docs/DESIGN.md) · [设计说明](docs/DESIGN.zh-CN.md) · [LICENSE](LICENSE)
 
+![The two states of the HUD: a collapsed corner badge and the expanded detail panel](assets/preview-en.png)
+
+> **About these images:** they are not photographs of a live DSH window. They are renders of the
+> plugin's own layout and colours, driven by its real style values and real figures — a capture tool
+> for the running GUI was not available when they were made. Treat them as a faithful layout
+> reference, not as evidence of a running install. Pull requests replacing them with genuine
+> screenshots are welcome.
+
 - **Account balance** — recharge balance + bonus balance, read through the same service the
   *Settings → Account & balance* page uses (`ctx.deepseekAccount.getBalance()`).
 - **Two cost figures** — a token-based *estimate* from the official price table, and an *actual*

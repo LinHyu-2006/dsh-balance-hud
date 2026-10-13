@@ -45,6 +45,9 @@ function readJsonTolerant(file) {
   return JSON.parse(raw.replace(/^\uFEFF/, ''));
 }
 
+/** 本插件的清单：发布清单 `files` 与 `dsh` 声明都从它读。 */
+const ownPackage = readJsonTolerant(path.join(packageRoot, 'package.json'));
+
 /**
  * 写 JSON，**不带 BOM**。
  * @param file - 文件路径。
@@ -108,11 +111,32 @@ if (!dryRun) {
 
   // 把源码复制到 profile 的 plugins/ 下（客户端 bundle 走 /plugins 路由，
   // 必须真的在 profile 目录里，不能只靠 node_modules 链接）。
-  fs.mkdirSync(path.join(installDir, 'lib'), { recursive: true });
-  for (const rel of ['package.json', 'cordis.patch.yml', 'README.md', 'LICENSE', 'lib/index.js', 'lib/client.js']) {
+  //
+  // 复制清单**从 package.json 的 `files` 派生**，不再手写：
+  // 手写清单会和发布清单漂移（新增一个要发布的文件时，npm 里有、本地安装里没有），
+  // 那种不一致只在用户那边才暴露。`files` 是 npm 的语义，所以顺带保证
+  // "本地能装"和"发包能装"看到的是同一批文件。
+  const publishList = Array.isArray(ownPackage.files) ? ownPackage.files : [];
+  const toCopy = [];
+  for (const entry of publishList) {
+    const abs = path.join(packageRoot, entry);
+    if (!fs.existsSync(abs)) continue;
+    if (fs.statSync(abs).isDirectory()) {
+      for (const name of fs.readdirSync(abs)) {
+        const inner = path.join(abs, name);
+        if (fs.statSync(inner).isFile()) toCopy.push(path.join(entry, name));
+      }
+    } else {
+      toCopy.push(entry);
+    }
+  }
+  // package.json 永远要复制（profile 靠它认插件），即使没写进 `files`
+  for (const rel of ['package.json', ...toCopy]) {
     const from = path.join(packageRoot, rel);
     if (!fs.existsSync(from)) continue;
-    fs.copyFileSync(from, path.join(installDir, rel));
+    const target = path.join(installDir, rel);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(from, target);
     log(`复制 ${rel}`);
   }
 

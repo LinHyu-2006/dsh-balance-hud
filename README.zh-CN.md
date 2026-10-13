@@ -6,6 +6,13 @@
 
 [English](README.md) · [设计说明](docs/DESIGN.zh-CN.md) · [Design notes](docs/DESIGN.md) · [LICENSE](LICENSE)
 
+![HUD 的两种状态：折叠角标与展开明细面板](assets/preview-zh.png)
+
+> **关于这些图片**：它们**不是运行中 DSH 窗口的真实截图**，而是按插件自身的布局与配色
+> 渲染出来的图（用的是真实样式取值与真实数字）—— 制作时没有可用的实时界面截图工具。
+> 请把它们当作如实的**布局参考**，而不是"已装好并正在运行"的证据。
+> 欢迎用真实截图替换。
+
 ```bash
 node tools/install.mjs    # 安装到 ~/.dsh/profiles/desktop，然后重启 DSH
 node tools/smoke.mjs      # 离线冒烟套件（83 条断言），不需要装 DSH

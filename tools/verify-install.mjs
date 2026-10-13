@@ -49,7 +49,15 @@ const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
 step('name 正确', pkg.name === 'dsh-balance-hud', pkg.name);
 step('声明 dsh.bundle.patch', typeof pkg.dsh?.bundle?.patch === 'string', pkg.dsh?.bundle?.patch);
 step('声明 dsh.client.platform = web', pkg.dsh?.client?.platform === 'web');
-step('dsh.client.inject 是数组', Array.isArray(pkg.dsh?.client?.inject));
+// `dsh.client.inject` 在 DSH 的 schema 里是**可选**的（只用于激活顺序的先验提示，
+// 不参与规则判定）。所以这里只在"声明了"时要求它是字符串数组，
+// 不声明也算通过 —— 早期这里是硬断言，导致删掉一个用不到的声明就误报失败。
+step(
+  'dsh.client.inject 若声明则必须是字符串数组',
+  pkg.dsh?.client?.inject === undefined ||
+    (Array.isArray(pkg.dsh.client.inject) && pkg.dsh.client.inject.every((n) => typeof n === 'string')),
+  pkg.dsh?.client?.inject === undefined ? '(未声明，合法)' : undefined,
+);
 
 const patchPath = path.resolve(dir, pkg.dsh.bundle.patch);
 step('patch 文件存在', fs.existsSync(patchPath), patchPath);

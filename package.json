@@ -1,13 +1,13 @@
 {
   "name": "dsh-balance-hud",
-  "version": "0.1.0",
-  "private": true,
+  "version": "1.0.0",
   "type": "module",
-  "description": "DSH Web GUI 右下角常驻 HUD：显示 DeepSeek 账户余额与本会话花费（官方价格表预估 + 余额减少量实际值），含充值自动识别",
+  "description": "Balance and per-session spend HUD for the DSH Web GUI: shows your DeepSeek balance and what this session has cost, with budget alerts, peak-hour warnings and opt-in official price sync.",
   "keywords": [
     "dsh",
     "dsh-plugin",
     "deepseek",
+    "deepseek-harness",
     "balance",
     "cost",
     "hud"
@@ -21,17 +21,27 @@
   "files": [
     "lib",
     "cordis.patch.yml",
+    "assets",
+    "screenshots.json",
     "README.md",
     "LICENSE"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LinHyu-2006/dsh-balance-hud.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LinHyu-2006/dsh-balance-hud/issues"
+  },
+  "homepage": "https://github.com/LinHyu-2006/dsh-balance-hud#readme",
+  "engines": {
+    "dsh": ">=0.1.7-rc.1 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "inject": [
-        "@deepseek-ai/dsh-client-ui-primitives"
-      ],
       "platform": "web"
     }
   },
