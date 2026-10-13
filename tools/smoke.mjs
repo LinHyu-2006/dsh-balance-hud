@@ -1400,6 +1400,86 @@ console.log(`✓ 可见性联动：回前台立刻补读（${before} → ${balan
   console.log('✓ 模型对齐：默认跟随会话，非法值逐字段收敛');
 }
 
+// 16) 界面语言：中英双语
+{
+  const { MESSAGES, normalizeLang, resolveLang, translate, normalizeSettings, defaultSettings } =
+    normal.plugin.__test;
+
+  // 16a) 中英键集合必须完全一致 —— 漏一条就会出现"切到英文后露出中文"
+  const zhKeys = Object.keys(MESSAGES.zh).sort();
+  const enKeys = Object.keys(MESSAGES.en).sort();
+  const onlyZh = zhKeys.filter((k) => !enKeys.includes(k));
+  const onlyEn = enKeys.filter((k) => !zhKeys.includes(k));
+  if (onlyZh.length > 0) throw new Error(`英文缺这些键：${onlyZh.join(', ')}`);
+  if (onlyEn.length > 0) throw new Error(`中文缺这些键：${onlyEn.join(', ')}`);
+  if (zhKeys.length < 60) throw new Error(`文案太少，可能没接全：${zhKeys.length}`);
+  console.log(`✓ 语言：中英键集合完全一致（各 ${zhKeys.length} 条）`);
+
+  // 16b) 没有空值 —— 空串在界面上就是一片空白
+  for (const lang of ['zh', 'en']) {
+    for (const [key, value] of Object.entries(MESSAGES[lang])) {
+      if (typeof value !== 'string' || value.trim() === '') throw new Error(`${lang}.${key} 是空值`);
+    }
+  }
+  console.log('✓ 语言：无空文案');
+
+  // 16c) 占位符两侧必须一致 —— 英文漏一个 {n} 就会显示成字面 "{n}"
+  const placeholders = (text) => (text.match(/\{[a-zA-Z]+\}/g) ?? []).sort().join(',');
+  for (const key of zhKeys) {
+    const a = placeholders(MESSAGES.zh[key]);
+    const b = placeholders(MESSAGES.en[key]);
+    if (a !== b) throw new Error(`${key} 的占位符不一致：中文 [${a}] vs 英文 [${b}]`);
+  }
+  console.log('✓ 语言：占位符中英一一对应');
+
+  // 16d) locale id 归一：按前缀匹配，认不出的当英文
+  const cases = [
+    ['zh-CN', 'zh'],
+    ['zh', 'zh'],
+    ['zh-Hans', 'zh'],
+    ['zh-Hans-CN', 'zh'],
+    ['zh-TW', 'zh'],
+    ['en', 'en'],
+    ['en-US', 'en'],
+    ['ja-JP', 'en'],
+    [undefined, 'en'],
+    ['', 'en']
+  ];
+  for (const [input, expected] of cases) {
+    const got = normalizeLang(input);
+    if (got !== expected) throw new Error(`normalizeLang(${JSON.stringify(input)}) = ${got}，期望 ${expected}`);
+  }
+  console.log('✓ 语言：locale id 按前缀归一（zh-CN / zh-Hans / zh-Hans-CN 都认中文）');
+
+  // 16e) 解析优先级：显式设置 > DSH 语言 > 中文兜底
+  if (resolveLang('en', 'zh-CN') !== 'en') throw new Error('显式设置应压过 DSH 语言');
+  if (resolveLang('zh', 'en-US') !== 'zh') throw new Error('显式设置应压过 DSH 语言');
+  if (resolveLang('auto', 'en-US') !== 'en') throw new Error('auto 应跟随 DSH');
+  if (resolveLang('auto', undefined) !== 'zh') throw new Error('读不到 DSH 语言时应兜底中文');
+  if (resolveLang(undefined, 'zh-CN') !== 'zh') throw new Error('未设置时应跟随 DSH');
+  console.log('✓ 语言：优先级为 显式设置 > DSH > 中文兜底');
+
+  // 16f) 占位替换真的生效
+  const filled = translate('zh', 'settingsSyncUpdated', { n: 2 });
+  if (!filled.includes('2') || filled.includes('{n}')) throw new Error(`占位未替换：${filled}`);
+  const filledEn = translate('en', 'settingsPriceBuiltin', { date: '2026-09-29' });
+  if (!filledEn.includes('2026-09-29') || filledEn.includes('{date}')) {
+    throw new Error(`英文占位未替换：${filledEn}`);
+  }
+  if (translate('zh', 'settingsTitle') !== MESSAGES.zh.settingsTitle) throw new Error('中文取词应与表一致');
+  // 多出来的占位变量不该破坏文本
+  if (translate('zh', 'refresh', { unused: 1 }) !== MESSAGES.zh.refresh) {
+    throw new Error('无用占位不应影响结果');
+  }
+  console.log('✓ 语言：占位替换生效，取值正确');
+
+  // 16g) uiLanguage 默认 auto，且非法值收敛
+  if (defaultSettings().uiLanguage !== 'auto') throw new Error('语言默认应为 auto');
+  if (normalizeSettings({ uiLanguage: 'fr' }).uiLanguage !== 'auto') throw new Error('非法语言应收敛为 auto');
+  if (normalizeSettings({ uiLanguage: 'en' }).uiLanguage !== 'en') throw new Error('合法语言应保留');
+  console.log('✓ 语言：默认跟随 DSH，非法值收敛');
+}
+
 console.log('\n全部冒烟测试通过');
 // 组件里的轮询定时器会吊住事件循环，显式退出。
 process.exit(0);

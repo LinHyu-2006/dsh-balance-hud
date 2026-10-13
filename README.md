@@ -28,7 +28,7 @@ DeepSeek **account balance** and the **cost of the current session**.
 
 ```bash
 node tools/install.mjs    # install into ~/.dsh/profiles/desktop, then restart DSH
-node tools/smoke.mjs      # offline smoke suite (76 assertions), no DSH install needed
+node tools/smoke.mjs      # offline smoke suite (83 assertions), no DSH install needed
 ```
 
 ## The HUD
@@ -429,7 +429,7 @@ node tools/verify-install.mjs             # verify a real installation
 
 `tools/smoke.mjs` evaluates the real `lib/client.js` against a fake React runtime, fake host
 responses, a fake `localStorage` and a fake `document`, then drives the component through its hook
-cycle. It prints one `✓` line per check (76 in total) and exits non-zero on the first failure,
+cycle. It prints one `✓` line per check (83 in total) and exits non-zero on the first failure,
 covering module/slot registration, the card layout, hover and fold interaction, the balance
 protocol and every route failure mode, pricing arithmetic, display precision, the external-change
 classifier (top-ups **and** bonus expiry), persistence and the migration chain, and

@@ -591,7 +591,7 @@ quietly start depending on the network.
   events). The fetch mock throws on any URL other than the plugin's own routes and on any method other than
   `GET` — a regression guard for the relay contract, and for the rule that the client half never reaches a
   non-loopback host (§7.1).
-- It prints one `✓` line per check (76 of them) and throws on the first failure.
+- It prints one `✓` line per check (83 of them) and throws on the first failure.
 
 Regression guards worth knowing, because each encodes a deliberate decision:
 
