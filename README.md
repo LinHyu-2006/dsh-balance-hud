@@ -35,9 +35,27 @@ DeepSeek **account balance** and the **cost of the current session**.
   budget, and the panel counts down to the next peak/off-peak switch.
 
 ```bash
+# Windows — double-click tools\install.cmd, or:
+tools\install.cmd
+
+# macOS / Linux:
+sh tools/install.sh
+```
+
+Both launchers find Node for you — including **the runtime DSH already ships**, which is not on
+`PATH`. If your machine has no Node at all, they say so and tell you what to do, instead of failing
+with `node: command not found`. Install into a different profile with `--profile <dir>`, preview with
+`--dry-run`, undo with `--uninstall`.
+
+Prefer to run it yourself? The plain form assumes Node is on `PATH`:
+
+```bash
 node tools/install.mjs    # install into ~/.dsh/profiles/desktop, then restart DSH
 node tools/smoke.mjs      # offline smoke suite (83 assertions), no DSH install needed
 ```
+
+**Then restart DSH.** Adding a plugin changes the profile's bundle list, which is not hot-reloaded;
+a page refresh alone will not pick it up.
 
 ## The HUD
 
@@ -51,8 +69,8 @@ node tools/smoke.mjs      # offline smoke suite (83 assertions), no DSH install 
 Hovering the card expands a detail panel: balance rows (recharge / bonus / total), the three priced
 components of the estimate, the actual figure, token counts, and — with parallel sessions — the
 apportionment rows (`Session share`, `Other sessions`, `Tracked sessions`, `Account total`). The
-panel uses 4 decimals; the card uses 2. The shipped labels are currently Chinese; the English names
-here are what each row means.
+panel uses 4 decimals; the card uses 2. The interface ships in **Chinese and English** and follows
+DSH's language by default; the English names below are what each row means.
 
 | Field | Meaning |
 | --- | --- |
@@ -408,10 +426,20 @@ timestamp; a `304` refreshes the check time without touching the table. The sett
 This is a local profile plugin; nothing is published to npm.
 
 ```powershell
-node tools/install.mjs                     # install into ~/.dsh/profiles/desktop
+tools\install.cmd                          # Windows: finds Node for you (recommended)
+sh tools/install.sh                        # macOS / Linux: same
+node tools/install.mjs                     # install into ~/.dsh/profiles/desktop (needs Node on PATH)
+node tools/install.mjs --profile <dir>     # a different profile
 node tools/install.mjs --dry-run           # preview, write nothing
 node tools/install.mjs --uninstall         # remove it again
 ```
+
+The two launchers exist because `node ...` assumes Node is on `PATH`, which is not a safe assumption
+for a DSH user: DSH ships its own Node runtime and does **not** put it on `PATH`. The launchers look
+in this order — `DSH_NODE` → `node` on `PATH` → DSH's bundled runtime under
+`~/.dsh/dsh-runtimes/*/dependencies/node/bin/node` → the usual install locations — and if none is
+found they print how to fix it rather than failing with `node: command not found`. Override the DSH
+home with `DSH_HOME` when it is not `~/.dsh`.
 
 By hand, installing means placing the directory at
 `~/.dsh/profiles/<profile>/plugins/dsh-balance-hud` (the client bundle is served from the profile,

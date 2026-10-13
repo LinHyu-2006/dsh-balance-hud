@@ -14,9 +14,26 @@
 > 欢迎用真实截图替换。
 
 ```bash
+# Windows —— 双击 tools\install.cmd，或在命令行里：
+tools\install.cmd
+
+# macOS / Linux：
+sh tools/install.sh
+```
+
+两个启动器都会**替你找 Node**，包括 **DSH 自带的那份运行时**（它不在 `PATH` 上）。
+如果你的机器完全没装 Node，它会明确告诉你怎么办，而不是丢一句 `node: command not found`。
+换个 profile 用 `--profile <目录>`，只看不改用 `--dry-run`，卸掉用 `--uninstall`。
+
+想自己跑也行 —— 下面这条假定 Node 已经在 `PATH` 上：
+
+```bash
 node tools/install.mjs    # 安装到 ~/.dsh/profiles/desktop，然后重启 DSH
 node tools/smoke.mjs      # 离线冒烟套件（83 条断言），不需要装 DSH
 ```
+
+**装完必须重启 DSH。** 装插件会改 profile 的 bundle 列表，那个列表**不热加载** ——
+只刷新页面不会生效。
 
 - **账户余额** —— 充值余额 + 赠金余额，走的是「设置 → 账号与余额」同一个服务
   （`ctx.deepseekAccount.getBalance()`）。

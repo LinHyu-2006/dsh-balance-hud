@@ -116,7 +116,11 @@ if (!dryRun) {
   // 手写清单会和发布清单漂移（新增一个要发布的文件时，npm 里有、本地安装里没有），
   // 那种不一致只在用户那边才暴露。`files` 是 npm 的语义，所以顺带保证
   // "本地能装"和"发包能装"看到的是同一批文件。
-  const publishList = Array.isArray(ownPackage.files) ? ownPackage.files : [];
+  // 本地安装清单优先读 `installFiles`，没有才回落到 npm 的 `files`。
+  // 两者分开的原因：`files` 是"发包要带的东西"，里面可以有 README 用的图片；
+  // 而 profile 只需要运行时真正要加载的文件，多复制图片是纯粹的浪费。
+  const source = Array.isArray(ownPackage.installFiles) ? ownPackage.installFiles : ownPackage.files;
+  const publishList = Array.isArray(source) ? source : [];
   const toCopy = [];
   for (const entry of publishList) {
     const abs = path.join(packageRoot, entry);
