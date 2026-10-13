@@ -39,7 +39,7 @@ GitHub 免费账号即可，开源公开仓库不需要付费。
 
 ```powershell
 cd <本仓库所在目录>          # 例如 ...\_plugin_build\dsh-balance-hud
-git config user.name  "LHY"
+git config user.name  "<你的名字>"
 git config user.email "12345678+你的用户名@users.noreply.github.com"
 ```
 
@@ -47,7 +47,7 @@ git config user.email "12345678+你的用户名@users.noreply.github.com"
 
 ### 1c. 修正已完成的首次提交
 
-首次提交目前用的是占位邮箱 `LHY@users.noreply.github.com`。
+首次提交目前用的是占位邮箱 `<你的名字>@users.noreply.github.com`。
 换成正式匿名地址（**不需要重建仓库**）：
 
 ```powershell
