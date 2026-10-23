@@ -1,6 +1,6 @@
 {
   "name": "dsh-balance-hud",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "description": "Balance and per-session spend HUD for the DSH Web GUI: shows your DeepSeek balance and what this session has cost, with budget alerts, peak-hour warnings and opt-in official price sync.",
   "keywords": [
