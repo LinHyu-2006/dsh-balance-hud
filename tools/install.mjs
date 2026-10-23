@@ -135,7 +135,8 @@ if (!dryRun) {
     }
   }
   // package.json 永远要复制（profile 靠它认插件），即使没写进 `files`
-  for (const rel of ['package.json', ...toCopy]) {
+  const wanted = new Set(['package.json', ...toCopy].map((rel) => path.normalize(rel)));
+  for (const rel of wanted) {
     const from = path.join(packageRoot, rel);
     if (!fs.existsSync(from)) continue;
     const target = path.join(installDir, rel);
@@ -143,6 +144,38 @@ if (!dryRun) {
     fs.copyFileSync(from, target);
     log(`复制 ${rel}`);
   }
+
+  // **清理安装目录里多出来的文件。**
+  // 只复制不删除会留下历史遗留物：`installFiles` 缩小后（比如把 README 用的
+  // 图片从安装清单里去掉），上一次装进去的旧文件会一直留在 profile 里，
+  // 于是"本地"和"安装副本"悄悄不一致 —— 排查这种差异很费时间。
+  // 这个目录完全属于本插件，所以不在清单里的文件都可以安全删除。
+  const extra = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (!wanted.has(path.normalize(path.relative(installDir, full)))) extra.push(full);
+    }
+  };
+  if (fs.existsSync(installDir)) walk(installDir);
+  for (const file of extra) {
+    fs.rmSync(file, { force: true });
+    log(`删除多余文件 ${path.relative(installDir, file)}`);
+  }
+  // 顺便清掉因删除文件而变空的目录
+  const pruneEmpty = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const full = path.join(dir, entry.name);
+      pruneEmpty(full);
+      if (fs.readdirSync(full).length === 0) {
+        fs.rmdirSync(full);
+        log(`删除空目录 ${path.relative(installDir, full)}`);
+      }
+    }
+  };
+  if (fs.existsSync(installDir)) pruneEmpty(installDir);
 
   // 建 node_modules 链接。pnpm 对 `file:` 依赖按内容缓存，
   // 目录被删掉后会误报 "Already up to date" 而不重建，所以这里自己保证链接存在。
