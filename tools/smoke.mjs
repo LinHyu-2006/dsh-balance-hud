@@ -1480,6 +1480,45 @@ console.log(`✓ 可见性联动：回前台立刻补读（${before} → ${balan
   console.log('✓ 语言：默认跟随 DSH，非法值收敛');
 }
 
+// 17) 设置行必须真的能渲染
+//
+// 为什么单独查这一条：本套件以前只渲染浮层，从没渲染过设置里那一行。
+// 于是"组件用了某个 props、但注册时没 inject"这种错误一路漏过 ——
+// 真实症状是整行在设置页里**直接消失**（React 渲染抛错），
+// 而单测全绿。这里用注册时真正注入的 props 渲染一次，把它钉住。
+{
+  installFetchMock();
+  installStorageMock();
+  installDocumentMock(false);
+
+  const { ctx, registered } = makeCtx({ usage: { uncachedInputTokens: 1, outputTokens: 1, cacheReadTokens: 1, cacheWriteTokens: 0 } });
+  plugin.apply(ctx);
+  const settingsEntry = registered.find((entry) => entry.slot === 'settings.general.item');
+  if (settingsEntry === undefined) throw new Error('没有注册 settings.general.item');
+
+  // 17a) 组件源码里用到的 `ctx` 必须有注入提供
+  const injected = settingsEntry.options.inject();
+  if (injected === null || typeof injected !== 'object') throw new Error('inject() 没返回对象');
+  if (!('ctx' in injected)) {
+    throw new Error('设置行的 inject 没有提供 ctx —— 组件里用到它，渲染时会 ReferenceError');
+  }
+  if (!('settingsStore' in injected)) throw new Error('设置行缺少 settingsStore');
+
+  // 17b) 拿真实注入的 props 渲染一次，不许抛错、不许返回空
+  slots.length = 0;
+  effectQueue = [];
+  cursor = 0;
+  let tree;
+  try {
+    tree = settingsEntry.Component(injected);
+  } catch (error) {
+    throw new Error(`设置行渲染抛错：${error && error.message ? error.message : String(error)}`);
+  }
+  if (tree === null || tree === undefined) throw new Error('设置行渲染结果为空');
+  if (typeof tree !== 'object') throw new Error(`设置行渲染结果不是元素：${String(tree)}`);
+  console.log('✓ 设置行：用真实注入的 props 能渲染（含 ctx / settingsStore）');
+}
+
 console.log('\n全部冒烟测试通过');
 // 组件里的轮询定时器会吊住事件循环，显式退出。
 process.exit(0);
