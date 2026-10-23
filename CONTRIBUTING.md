@@ -12,7 +12,7 @@ node tools/verify-install.mjs --package   # packaging self-check, no DSH needed
 Both must exit `0`. The smoke suite is the contract: if you change behaviour, either make the
 suite agree with the new behaviour deliberately, or the suite will tell you what you broke.
 
-CI (`.github/workflows/ci.yml`) runs exactly those two scripts on **ubuntu, windows and macos** with
+CI (`.github/workflows/ci.yml`) runs exactly those two scripts on **ubuntu and windows** with
 Node 20. Both are fully offline — no DSH install, no network, no build step — so the matrix runs in
 clean containers and proves that line endings (`.gitattributes` pins LF), path derivation and
 `import.meta` usage do not depend on Windows. A green run on all three is the bar for a pull request.

@@ -391,7 +391,7 @@ node tools/verify-install.mjs             # 校验真实安装
 页面结构损坏或档位反常时**整条放弃**；`resolvePrices` 的来源可分辨；缓存落盘往返保留条件请求头；
 以及默认零外联 —— 非法间隔收敛为关闭、`24 小时` 是默认档。
 
-CI（`.github/workflows/ci.yml`）在 **ubuntu / windows / macos** 上用 Node 20 跑这两个离线脚本 ——
+CI（`.github/workflows/ci.yml`）在 **ubuntu / windows** 上用 Node 22 跑这两个离线脚本（macOS 每周单独跑一次）——
 `node tools/smoke.mjs` 与 `node tools/verify-install.mjs --package`。两个脚本都**完全离线**：
 不依赖 DSH 安装、不联网、不需要构建，所以能在干净容器里跑，也顺带证明行尾
 （`.gitattributes` 锁 LF）、路径派生与 `import.meta` 用法都不依赖 Windows。
@@ -408,7 +408,7 @@ CI（`.github/workflows/ci.yml`）在 **ubuntu / windows / macos** 上用 Node 2
 | `lib/index.js` | Host 半边：只读回环路由（余额、赠金信号、可选的价格同步、模型列表） |
 | `lib/client.js` | 浏览器半边：`shell.overlay` HUD、`settings.general.item` 设置行、价格表解析与全部记账逻辑 |
 | `tools/` | 安装脚本、安装校验、离线冒烟套件 |
-| `.github/workflows/ci.yml` | 离线冒烟 + 打包自检，跑 ubuntu / windows / macos |
+| `.github/workflows/ci.yml` | 离线冒烟 + 打包自检，跑 ubuntu / windows；macOS 每周跑 |
 | `docs/DESIGN.zh-CN.md` | 贡献者设计说明 —— 记账模型的完整推导 |
 
 ## 隐私与安全

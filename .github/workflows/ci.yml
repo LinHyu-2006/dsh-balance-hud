@@ -1,12 +1,15 @@
 name: CI
 
-# 两个校验脚本都是**完全离线**的：不依赖 DSH 安装、不联网、不需要构建。
-# 所以这里可以在干净容器里跑，而且能覆盖 Windows 之外的平台。
+# Both verification scripts are fully offline: no DSH install, no network,
+# no build step. That is why they can run in a clean container.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Weekly macOS run (see the macos job for why it is not on every push).
+    - cron: '0 3 * * 1'
 
 jobs:
   verify:
@@ -15,19 +18,55 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 插件是手写 bundle，没有构建步骤；在多平台跑是为了证明
-        # 行尾（.gitattributes 锁 LF）、路径派生、`import.meta` 用法都不依赖 Windows。
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # The plugin is a hand-written bundle with no build step. Running on
+        # both platforms proves that line endings (.gitattributes pins LF),
+        # path derivation and `import.meta` usage do not depend on Windows.
+        os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      # v7 targets the Node 24 action runtime; v4 still targeted Node 20,
+      # which GitHub now deprecates on hosted runners.
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Offline smoke suite
         run: node tools/smoke.mjs
 
       - name: Packaging self-check
-        # 不依赖任何 DSH 安装：只校验清单、patch 文件与两份入口的形状。
+        # Does not need a DSH install: it only checks the manifest, the patch
+        # file and the shape of both entry points.
+        run: node tools/verify-install.mjs --package
+
+  macos:
+    # macOS is checked weekly and on demand rather than on every push.
+    #
+    # GitHub's own annotation says it plainly:
+    #   "The job was not acquired by Runner of type hosted even after
+    #    multiple attempts"
+    #   "Due to capacity constraints, jobs targeting macOS arm64 runners may
+    #    experience longer queue times."
+    # A job that never gets a runner settles as `cancelled`, which marks the
+    # whole run red for a reason that has nothing to do with the code — and a
+    # permanently red badge is worse than slightly less coverage.
+    #
+    # The plugin is pure JavaScript with no native dependencies, and Linux
+    # already exercises the POSIX code path, so weekly macOS coverage plus
+    # `continue-on-error` is the honest trade-off: still tested, never noisy.
+    name: smoke + packaging (macos-latest)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Offline smoke suite
+        run: node tools/smoke.mjs
+
+      - name: Packaging self-check
         run: node tools/verify-install.mjs --package

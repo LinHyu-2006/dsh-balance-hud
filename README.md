@@ -484,10 +484,13 @@ persistence guard is the lossless round trip: switching sessions through `checko
 `undefined` field.
 
 CI (`.github/workflows/ci.yml`) runs both offline scripts — `node tools/smoke.mjs` and
-`node tools/verify-install.mjs --package` — on **ubuntu, windows and macos** with Node 20. Neither
-script needs a DSH install, network access or a build step, so the matrix runs in clean containers and
-proves that line endings (`.gitattributes` pins LF), path derivation and `import.meta` usage do not
-depend on Windows.
+`node tools/verify-install.mjs --package` — on **ubuntu and windows** with Node 22. macOS runs the same
+two scripts weekly (and on demand) rather than on every push: GitHub's own annotation reports that
+macOS arm64 runners are capacity-constrained and jobs can be left without a runner and settle as
+`cancelled`, which would turn the badge red for reasons unrelated to the code. Neither script needs a
+DSH install, network access or a build step, so the matrix runs in clean containers and proves that
+line endings (`.gitattributes` pins LF), path derivation and `import.meta` usage do not depend on
+Windows.
 
 It does **not** cover the Host half (`lib/index.js` is never loaded — so the loopback filter, the
 outbound price fetch, its `If-None-Match`/`304` path and the model-list route have no offline test), a
@@ -501,7 +504,7 @@ step**.
 | `lib/index.js` | Host half: the read-only loopback routes (balance, bonus signal, opt-in price sync, model list) |
 | `lib/client.js` | Browser half: the `shell.overlay` HUD, the `settings.general.item` row, the price-table parser and all of the accounting |
 | `tools/` | Installer, installation verifier, offline smoke suite |
-| `.github/workflows/ci.yml` | Offline smoke suite + packaging self-check on ubuntu / windows / macos |
+| `.github/workflows/ci.yml` | Offline smoke suite + packaging self-check on ubuntu / windows; macOS weekly |
 | `docs/DESIGN.md` | Contributor design note — the accounting model in full ([简体中文](docs/DESIGN.zh-CN.md)) |
 
 ## Privacy and security
